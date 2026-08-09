@@ -441,6 +441,7 @@ bool XEmuWindows::_mapRealSystemDlls()
         // Register every export VA so a call to any of them is intercepted before the subset
         // CPU fetches real DLL code; the ~15 loader/memory APIs get modelled, the rest a no-op.
         const QList<XEmuFileFormat::EXPORT_ENTRY> exports = pDll->getExportEntries();
+        _collectForwardedExports(exports);
         int nReg = 0;
         for (const XEmuFileFormat::EXPORT_ENTRY &e : exports) {
             if (e.nRVA <= 0) {
@@ -986,6 +987,38 @@ QList<XEmuWindows::SYN_EXPORT> XEmuWindows::_collectImportsFor(const QString &sL
         result.append(e);
     };
 
+    // Merge symbols promised by forwarders in mapped real DLLs.  Allocate
+    // trampolines only when the target contract is actually loaded, preserving
+    // the stable API-arena layout for unrelated runs.
+    const QList<FORWARDED_EXPORT> forwarded =
+        m_mapForwardedExports.value(sLibraryLower);
+    for (int i = 0; i < forwarded.size(); ++i) {
+        const FORWARDED_EXPORT &forward = forwarded.at(i);
+        SYN_EXPORT e;
+        if (!forward.sName.isEmpty()) {
+            if (seenNames.contains(forward.sName)) {
+                continue;
+            }
+            seenNames.insert(forward.sName);
+            e.sName = forward.sName;
+            e.nOrdinal = -1;
+            e.nStub = m_pWinApi->stubFor(
+                sLibraryLower, forward.sName, -1);
+        } else if (forward.nOrdinal >= 1) {
+            if (seenOrdinals.contains(forward.nOrdinal)) {
+                continue;
+            }
+            seenOrdinals.insert(forward.nOrdinal);
+            e.sName = QString();
+            e.nOrdinal = forward.nOrdinal;
+            e.nStub = m_pWinApi->stubFor(
+                sLibraryLower, QString(), forward.nOrdinal);
+        } else {
+            continue;
+        }
+        result.append(e);
+    }
+
     if (m_bAsdPackMode && (sLibraryLower == QStringLiteral("kernel32.dll"))) {
         static const char *const kAsdPack[] = {
             "CloseHandle", "GetModuleHandleA", "GetProcAddress", "LoadLibraryExA",
@@ -1050,6 +1083,72 @@ QList<XEmuWindows::SYN_EXPORT> XEmuWindows::_collectImportsFor(const QString &sL
     }
 
     return result;
+}
+
+void XEmuWindows::_collectForwardedExports(
+    const QList<XEmuFileFormat::EXPORT_ENTRY> &exports)
+{
+    // Keep this derived catalog bounded even for hostile export directories.
+    const int N_MAX_TARGET_MODULES = 512;
+    const int N_MAX_EXPORTS_PER_TARGET = 2048;
+    const int N_MAX_TOTAL_EXPORTS = 32768;
+
+    for (int i = 0;
+         (i < exports.size())
+         && (m_nForwardedExportCount < N_MAX_TOTAL_EXPORTS);
+         ++i) {
+        const QString forwarder = exports.at(i).sForwarder;
+        const int nDot = forwarder.indexOf(QLatin1Char('.'));
+        if ((nDot <= 0) || (nDot + 1 >= forwarder.size())) {
+            continue;
+        }
+
+        QString sTargetModule = forwarder.left(nDot).toLower();
+        if (!sTargetModule.contains(QLatin1Char('.'))) {
+            sTargetModule += QStringLiteral(".dll");
+        }
+        if (!m_mapForwardedExports.contains(sTargetModule)
+            && (m_mapForwardedExports.size() >= N_MAX_TARGET_MODULES)) {
+            continue;
+        }
+
+        FORWARDED_EXPORT target;
+        target.nOrdinal = -1;
+        const QString sTargetSymbol = forwarder.mid(nDot + 1);
+        if (sTargetSymbol.startsWith(QLatin1Char('#'))) {
+            bool bOk = false;
+            const int nOrdinal = sTargetSymbol.mid(1).toInt(&bOk);
+            if (!bOk || (nOrdinal < 1) || (nOrdinal > 0xFFFF)) {
+                continue;
+            }
+            target.nOrdinal = nOrdinal;
+        } else {
+            target.sName = sTargetSymbol;
+        }
+
+        QList<FORWARDED_EXPORT> &listTarget =
+            m_mapForwardedExports[sTargetModule];
+        if (listTarget.size() >= N_MAX_EXPORTS_PER_TARGET) {
+            continue;
+        }
+
+        bool bDuplicate = false;
+        for (int j = 0; j < listTarget.size(); ++j) {
+            const FORWARDED_EXPORT &existing = listTarget.at(j);
+            if ((!target.sName.isEmpty()
+                 && (existing.sName == target.sName))
+                || (target.sName.isEmpty()
+                    && existing.sName.isEmpty()
+                    && (existing.nOrdinal == target.nOrdinal))) {
+                bDuplicate = true;
+                break;
+            }
+        }
+        if (!bDuplicate) {
+            listTarget.append(target);
+            ++m_nForwardedExportCount;
+        }
+    }
 }
 
 XADDR XEmuWindows::_createSyntheticModule(const QString &sNameLower)
@@ -1582,6 +1681,8 @@ bool XEmuWindows::setupProcess(XEmuFileFormat *pMainFormat, XEmuRegisters *pRegi
 {
     m_listLoaded.clear();
     m_mapNameToIndex.clear();
+    m_mapForwardedExports.clear();
+    m_nForwardedExportCount = 0;
     m_listModules.clear();
     m_bAsdPackMode = false;
     m_bImploderMode = false;

@@ -100,9 +100,10 @@ public:
     // a real system DLL is mapped: every reachable export VA must be intercepted so the subset
     // CPU never executes real DLL code).
     struct EXPORT_ENTRY {
-        QString sName;    // export name (empty for by-ordinal only)
-        qint64 nOrdinal;  // ordinal
-        qint64 nRVA;      // function RVA relative to the module base
+        QString sName;       // export name (empty for by-ordinal only)
+        qint64 nOrdinal;     // ordinal
+        qint64 nRVA;         // executable function RVA, or -1 for a forwarder
+        QString sForwarder;  // validated "module.symbol" forwarder, otherwise empty
     };
     virtual QList<EXPORT_ENTRY> getExportEntries() const
     {

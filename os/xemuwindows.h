@@ -52,6 +52,7 @@ public:
 
 private:
     friend struct XEmuWindowsLoaderListTestAccess;
+    friend struct XEmuWindowsForwarderTestAccess;
 
     struct LOADED {
         XEmuFileFormat *pFormat;
@@ -86,6 +87,11 @@ private:
         XADDR nStub;      // winapi trampoline this export resolves to
     };
 
+    struct FORWARDED_EXPORT {
+        QString sName;    // target symbol name, empty for an ordinal target
+        qint64 nOrdinal;  // target ordinal, -1 for a named target
+    };
+
     // Runtime loader modelling: create a minimal module image + a PEB Ldr entry for a
     // library loaded by name at runtime (LoadLibraryA). Returns the module base (used as
     // the HMODULE), or 0 on failure. Registered as the winapi module-creator callback.
@@ -95,6 +101,11 @@ private:
     // exports so a packer that rebuilds its IAT by walking the export table (PeX) resolves
     // to the same trampoline _patchImports would have written.
     QList<SYN_EXPORT> _collectImportsFor(const QString &sLibraryLower);
+    // Remember validated PE forwarder targets found in mapped real DLLs.  API-set
+    // contract DLLs are commonly absent as files; when the guest loads one, its
+    // synthetic export table is populated from these observed contracts.
+    void _collectForwardedExports(
+        const QList<XEmuFileFormat::EXPORT_ENTRY> &exports);
     // Write a minimal but valid PE image (DOS + NT headers + an export directory that names
     // the module AND exports `exports`) so code that parses the handle as a module finds a
     // real header, and code that walks the export table finds resolvable function addresses.
@@ -156,6 +167,8 @@ private:
 
     QList<LOADED> m_listLoaded;
     QMap<QString, int> m_mapNameToIndex;  // lower-case base name -> index in m_listLoaded
+    QMap<QString, QList<FORWARDED_EXPORT> > m_mapForwardedExports;
+    int m_nForwardedExportCount = 0;
 
     XADDR m_nPebAddress;
     XADDR m_nTebAddress;

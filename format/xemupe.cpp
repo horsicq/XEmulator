@@ -37,6 +37,109 @@ const quint32 N_REL_BASED_ARM_MOV32A = 5;
 const quint32 N_REL_BASED_ARM_MOV32T = 7;
 const quint32 N_REL_BASED_DIR64 = 10;
 const quint16 N_FILE_MACHINE_ARMNT = 0x01C4;
+
+// PE forwarders are NUL-terminated ASCII strings stored inside the export data
+// directory.  Keep parsing deliberately small and require the documented
+// "module.symbol" grammar before exposing one to the Windows loader model.
+const quint64 N_MAX_EXPORT_DIRECTORY_SIZE = 16 * 1024 * 1024;
+const quint32 N_MAX_FORWARDER_LENGTH = 511;
+
+bool isForwarderRVA(const XPE_DEF::IMAGE_DATA_DIRECTORY &directory,
+                    quint32 nRVA)
+{
+    if ((directory.VirtualAddress == 0) || (directory.Size == 0)) {
+        return false;
+    }
+
+    return (nRVA >= directory.VirtualAddress)
+        && ((quint64)nRVA - directory.VirtualAddress
+            < (quint64)directory.Size);
+}
+
+bool isValidForwarderModuleChar(quint8 nChar)
+{
+    return ((nChar >= 'A') && (nChar <= 'Z'))
+        || ((nChar >= 'a') && (nChar <= 'z'))
+        || ((nChar >= '0') && (nChar <= '9'))
+        || (nChar == '_') || (nChar == '-');
+}
+
+bool isValidForwarderString(const QByteArray &data)
+{
+    const int nDot = data.indexOf('.');
+    if ((nDot <= 0) || (nDot + 1 >= data.size())) {
+        return false;
+    }
+
+    for (int i = 0; i < nDot; ++i) {
+        if (!isValidForwarderModuleChar((quint8)data.at(i))) {
+            return false;
+        }
+    }
+
+    const QByteArray symbol = data.mid(nDot + 1);
+    if (symbol.startsWith('#')) {
+        if (symbol.size() == 1) {
+            return false;
+        }
+        quint32 nOrdinal = 0;
+        for (int i = 1; i < symbol.size(); ++i) {
+            const quint8 nChar = (quint8)symbol.at(i);
+            if ((nChar < '0') || (nChar > '9')) {
+                return false;
+            }
+            nOrdinal = nOrdinal * 10U + (quint32)(nChar - '0');
+            if (nOrdinal > 0xFFFFU) {
+                return false;
+            }
+        }
+        return nOrdinal >= 1;
+    }
+
+    for (int i = 0; i < symbol.size(); ++i) {
+        const quint8 nChar = (quint8)symbol.at(i);
+        if ((nChar < 0x21U) || (nChar > 0x7EU)
+            || (nChar == '/') || (nChar == '\\')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QString readValidatedForwarder(XPE *pPE,
+                               const XPE_DEF::IMAGE_DATA_DIRECTORY &directory,
+                               quint32 nRVA)
+{
+    if (!pPE || !isForwarderRVA(directory, nRVA)
+        || ((quint64)directory.Size > N_MAX_EXPORT_DIRECTORY_SIZE)) {
+        return QString();
+    }
+
+    const quint64 nRemaining = (quint64)directory.Size
+        - ((quint64)nRVA - directory.VirtualAddress);
+    const quint32 nLimit = (quint32)qMin<quint64>(
+        nRemaining, (quint64)N_MAX_FORWARDER_LENGTH + 1U);
+    QByteArray data;
+    data.reserve((int)qMin<quint32>(nLimit, N_MAX_FORWARDER_LENGTH));
+
+    for (quint32 i = 0; i < nLimit; ++i) {
+        const qint64 nOffset = pPE->relAddressToOffset((qint64)nRVA + i);
+        if ((nOffset < 0) || !pPE->isOffsetValid(nOffset)) {
+            return QString();
+        }
+        const quint8 nChar = pPE->read_uint8(nOffset);
+        if (nChar == 0) {
+            return isValidForwarderString(data)
+                ? QString::fromLatin1(data) : QString();
+        }
+        if (data.size() >= (int)N_MAX_FORWARDER_LENGTH) {
+            return QString();
+        }
+        data.append((char)nChar);
+    }
+
+    return QString();
+}
 }  // namespace
 
 XEmuPE::XEmuPE(QObject *pParent) : XEmuFileFormat(pParent), m_pFile(nullptr), m_pPE(nullptr), m_bValid(false), m_bExportCacheBuilt(false)
@@ -885,16 +988,19 @@ void XEmuPE::_buildExportCache() const
         return;
     }
 
-    XPE::EXPORT_HEADER exportHeader = m_pPE->getExport();
+    const QList<EXPORT_ENTRY> entries = getExportEntries();
 
-    for (int i = 0; i < exportHeader.listPositions.count(); i++) {
-        const XPE::EXPORT_POSITION &position = exportHeader.listPositions.at(i);
-
-        if (!position.sFunctionName.isEmpty()) {
-            m_mapExportByName.insert(position.sFunctionName, position.nRVA);
+    for (int i = 0; i < entries.count(); i++) {
+        const EXPORT_ENTRY &entry = entries.at(i);
+        if (entry.nRVA <= 0) {
+            continue;
         }
 
-        m_mapExportByOrdinal.insert((qint64)position.nOrdinal, position.nRVA);
+        if (!entry.sName.isEmpty()) {
+            m_mapExportByName.insert(entry.sName, entry.nRVA);
+        }
+
+        m_mapExportByOrdinal.insert(entry.nOrdinal, entry.nRVA);
     }
 }
 
@@ -928,6 +1034,9 @@ QList<XEmuFileFormat::EXPORT_ENTRY> XEmuPE::getExportEntries() const
     }
 
     XPE::EXPORT_HEADER exportHeader = m_pPE->getExport();
+    const XPE_DEF::IMAGE_DATA_DIRECTORY exportDirectory =
+        m_pPE->getOptionalHeader_DataDirectory(
+            XPE_DEF::S_IMAGE_DIRECTORY_ENTRY_EXPORT);
     listResult.reserve(exportHeader.listPositions.count());
 
     for (int i = 0; i < exportHeader.listPositions.count(); i++) {
@@ -936,6 +1045,14 @@ QList<XEmuFileFormat::EXPORT_ENTRY> XEmuPE::getExportEntries() const
         e.sName = position.sFunctionName;
         e.nOrdinal = (qint64)position.nOrdinal;
         e.nRVA = (qint64)position.nRVA;
+        if (isForwarderRVA(exportDirectory, position.nRVA)) {
+            // An EAT RVA inside the export directory points at data, never code.
+            // Preserve only a bounded, grammar-validated forwarder string and
+            // make the entry explicitly non-executable even when malformed.
+            e.sForwarder = readValidatedForwarder(
+                m_pPE, exportDirectory, position.nRVA);
+            e.nRVA = -1;
+        }
         listResult.append(e);
     }
 

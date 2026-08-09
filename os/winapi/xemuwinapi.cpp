@@ -1022,7 +1022,17 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
     if (sFunc == QStringLiteral("FreeLibrary")) { _return(pRegisters, 1, 1); return true; }
     if (sFunc == QStringLiteral("OpenProcess")) { _return(pRegisters, 0x00E70000u, 4); return true; }
     if (sFunc == QStringLiteral("SetErrorMode")) { _return(pRegisters, 0, 1); return true; }
-    if (sFunc == QStringLiteral("CloseHandle")) { _return(pRegisters, 1, 1); return true; }
+    if (sFunc == QStringLiteral("CloseHandle")) {
+        const quint32 nHandle = (quint32)_arg(pRegisters, 0);
+        // VMProtect 1.x uses CloseHandle(0xDEADC0DE) as an anti-debug probe.  A
+        // normal process receives FALSE for that deliberately invalid value;
+        // claiming success sends the loader down its debugger-found branch.
+        // Keep the existing synthetic/pseudo handles usable while rejecting the
+        // probe sentinel instead of pretending that every integer is a handle.
+        const bool bValid = (nHandle != 0) && (nHandle != 0xDEADC0DEu);
+        _return(pRegisters, bValid ? 1 : 0, 1);
+        return true;
+    }
     if (sFunc == QStringLiteral("SetConsoleCtrlHandler")) { _return(pRegisters, 1, 2); return true; }
     if (sFunc == QStringLiteral("SetFilePointer")) { _return(pRegisters, 0, 4); return true; }
     if (sFunc == QStringLiteral("SetHandleCount")) { _return(pRegisters, 1, 1); return true; }
@@ -1134,6 +1144,21 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
     if (sFunc == QStringLiteral("IsDebuggerPresent")) { _return(pRegisters, 0, 0); return true; }
     if (sFunc == QStringLiteral("CheckRemoteDebuggerPresent")) {  // BOOL(HANDLE, PBOOL)
         if (a1) m_pMemoryManager->writeDword(a1, 0);
+        _return(pRegisters, 1, 2);
+        return true;
+    }
+    if (sFunc == QStringLiteral("GetThreadContext")) {  // BOOL(HANDLE, LPCONTEXT)
+        // VMProtect 1.x requests CONTEXT_DEBUG_REGISTERS and treats an API
+        // failure as debugger evidence.  Preserve the caller's ContextFlags
+        // and report all six x86 hardware-debug registers clear, matching an
+        // ordinary thread with no debugger/watchpoints attached.
+        if (!a1) {
+            _return(pRegisters, 0, 2);
+            return true;
+        }
+        for (XADDR nOffset = 0x04; nOffset <= 0x18; nOffset += 4) {
+            m_pMemoryManager->writeDword(a1 + nOffset, 0);
+        }
         _return(pRegisters, 1, 2);
         return true;
     }
@@ -1379,10 +1404,15 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
             const quint32 nLen = (quint32)_arg(pRegisters, 3);
             quint32 nStatus = 0;             // STATUS_SUCCESS
             quint32 nVal = 0;                // buffer value for a non-debugged process
-            if (nClass == 0x1E) {            // ProcessDebugFlags: 1 = NOT debugged (0 = debugged)
+            if (nClass == 0x1E) {            // ProcessDebugObjectHandle: successful query, no debug object
+                // Some legacy VMProtect releases treat any NT failure status
+                // as an analysis anomaly even though newer Windows commonly
+                // reports STATUS_PORT_NOT_SET here. A successful zero handle
+                // is the same affirmative clean-process fact without sending
+                // that old loader down its anti-debug branch.
+                nStatus = 0;
+            } else if (nClass == 0x1F) {     // ProcessDebugFlags: 1 = NOT debugged (0 = debugged)
                 nVal = 1;
-            } else if (nClass == 0x1F) {     // ProcessDebugObjectHandle: no debug object -> STATUS_PORT_NOT_SET, handle 0
-                nStatus = 0xC0000353u;
             }                                // 0x07 ProcessDebugPort and the rest: 0 = not debugged
             const quint32 nFill = qMin<quint32>(nLen & ~3u, 0x20u);   // whole dwords only, capped
             if (pInfo) for (quint32 i = 0; i < nFill; i += 4) m_pMemoryManager->writeDword(pInfo + i, (i == 0) ? nVal : 0u);
@@ -1392,7 +1422,41 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
             return true;
         }
         if ((sFunc == QStringLiteral("NtSetInformationThread")) || (sFunc == QStringLiteral("ZwSetInformationThread"))) { _return(pRegisters, 0, 4); return true; }  // ThreadHideFromDebugger no-op
-        if ((sFunc == QStringLiteral("NtQuerySystemInformation")) || (sFunc == QStringLiteral("ZwQuerySystemInformation"))) { _return(pRegisters, 0, 4); return true; }
+        if ((sFunc == QStringLiteral("NtQuerySystemInformation")) || (sFunc == QStringLiteral("ZwQuerySystemInformation"))) {
+            const quint32 nClass = (quint32)_arg(pRegisters, 0);
+            const XADDR pInfo = (XADDR)_arg(pRegisters, 1);
+            const quint32 nLen = (quint32)_arg(pRegisters, 2);
+            const XADDR pRet = (XADDR)_arg(pRegisters, 3);
+            if (nClass == 0x0B) {            // SystemModuleInformation
+                // A zero-length probe must not claim success: VMProtect uses
+                // the documented size-query convention while looking for
+                // kernel-debugger drivers. Report a bounded empty module list.
+                const quint32 nRequired = 4;
+                if (pRet) m_pMemoryManager->writeDword(pRet, nRequired);
+                if (!pInfo || nLen < nRequired) {
+                    _return(pRegisters, 0xC0000004u, 4);  // STATUS_INFO_LENGTH_MISMATCH
+                } else {
+                    m_pMemoryManager->writeDword(pInfo, 0);  // NumberOfModules
+                    _return(pRegisters, 0, 4);
+                }
+                return true;
+            }
+            if (nClass == 0x23) {            // SystemKernelDebuggerInformation
+                const quint32 nRequired = 2;
+                if (pRet) m_pMemoryManager->writeDword(pRet, nRequired);
+                if (!pInfo || nLen < nRequired) {
+                    _return(pRegisters, 0xC0000004u, 4);
+                } else {
+                    m_pMemoryManager->writeByte(pInfo + 0, 0);  // DebuggerEnabled
+                    m_pMemoryManager->writeByte(pInfo + 1, 1);  // DebuggerNotPresent
+                    _return(pRegisters, 0, 4);
+                }
+                return true;
+            }
+            if (pRet) m_pMemoryManager->writeDword(pRet, 0);
+            _return(pRegisters, 0, 4);
+            return true;
+        }
 
         // Native memory management: model like the kernel32 Virtual* equivalents (in/out pointers).
         if ((sFunc == QStringLiteral("NtAllocateVirtualMemory")) || (sFunc == QStringLiteral("ZwAllocateVirtualMemory"))) {  // 6 args
