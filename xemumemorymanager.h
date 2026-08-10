@@ -106,6 +106,7 @@ public:
     typedef std::function<void(XADDR nAddress, quint32 nSize, quint64 nValue)> MEM_CALLBACK;
     typedef std::function<void(XADDR nAddress, quint32 nSize)> CODE_CALLBACK;
     typedef std::function<void(XADDR nAddress, quint32 nSize, bool bWrite)> INVALID_CALLBACK;
+    typedef quint64 CALLBACK_ID;
 
     explicit XEmuMemoryManager(QObject *pParent = nullptr);
 
@@ -116,6 +117,13 @@ public:
     void setWriteCallback(const MEM_CALLBACK &callback);
     void setCodeCallback(const CODE_CALLBACK &callback);
     void setInvalidCallback(const INVALID_CALLBACK &callback);
+    // Additional read/write subscribers coexist with the legacy single-owner
+    // setters above. Subscribers are invoked in registration order after the
+    // legacy callback. A value of zero is never a valid subscription id.
+    CALLBACK_ID addReadCallback(const MEM_CALLBACK &callback);
+    CALLBACK_ID addWriteCallback(const MEM_CALLBACK &callback);
+    bool removeReadCallback(CALLBACK_ID nId);
+    bool removeWriteCallback(CALLBACK_ID nId);
     void clearCallbacks();
 
     void clear();
@@ -195,6 +203,19 @@ private:
     void _coalesce();
     void _sort();
     static bool _regionAddressLess(const REGION &r1, const REGION &r2);  // std::sort comparator
+    void _fireReadCallbacks(XADDR nAddress, quint32 nSize,
+                            quint64 nValue) const;
+    void _fireWriteCallbacks(XADDR nAddress, quint32 nSize,
+                             quint64 nValue) const;
+
+    struct MEM_SUBSCRIBER {
+        CALLBACK_ID nId;
+        MEM_CALLBACK callback;
+
+        MEM_SUBSCRIBER() : nId(0) {}
+        MEM_SUBSCRIBER(CALLBACK_ID _nId, const MEM_CALLBACK &_callback)
+            : nId(_nId), callback(_callback) {}
+    };
 
     QList<REGION> m_listRegions;
     quint8 m_nBits;
@@ -206,6 +227,9 @@ private:
     MEM_CALLBACK m_writeCallback;
     CODE_CALLBACK m_codeCallback;
     INVALID_CALLBACK m_invalidCallback;
+    QList<MEM_SUBSCRIBER> m_listReadSubscribers;
+    QList<MEM_SUBSCRIBER> m_listWriteSubscribers;
+    CALLBACK_ID m_nNextCallbackId;
 };
 
 #endif  // XEMUMEMORYMANAGER_H

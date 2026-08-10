@@ -50,6 +50,12 @@ public:
 
     QString getRegistersText(const XEmuRegisters *pRegisters) const override;
 
+    // Decode the instruction bytes currently mapped at nAddress into a caller-
+    // owned value. This bypasses the translation-block cache and does not
+    // execute or retain the result, so tracing self-modifying x86 code can bind
+    // exact pre-step bytes to the decoder view without exposing cache internals.
+    bool decodeMicroOpSnapshot(XADDR nAddress, XEmuMicroOp *pResult);
+
     // Diagnostic: read the x87 FPU register stack. ST(i) as the modelled double, and its
     // int64 round-trip (what fistp would store) so a caller can spot precision loss on
     // 64-bit-integer accumulators (double mantissa is 52 bits; real x87 has 64).
@@ -72,7 +78,7 @@ private:
         bool bRexB;
         bool bHasRex;
         bool bOpSize16;
-        int nSegSource;  // 0 none, 1 FS, 2 GS
+        int nSegSource;  // 0 none, 1 FS, 2 GS, 3 ES, 4 CS, 5 SS, 6 DS
         int nOpSize;
         int nAddrSize;
         int nRep;  // 0 none, 1 rep/repe (F3), 2 repne (F2)

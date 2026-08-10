@@ -1052,6 +1052,16 @@ quint64 XEmuX86::_mmxShift(int nOp, quint64 a, quint64 nCount)
     }
 }
 
+bool XEmuX86::decodeMicroOpSnapshot(
+    XADDR nAddress, XEmuMicroOp *pResult)
+{
+    if (!pResult) return false;
+    XEmuMicroOp op;
+    if (!_decodeInsn(nAddress, op)) return false;
+    *pResult = op;
+    return true;
+}
+
 bool XEmuX86::_decodeInsn(XADDR nAddress, XEmuMicroOp &op)
 {
     DEC dec;

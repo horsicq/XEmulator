@@ -33,7 +33,8 @@ XEmuMemoryManager::XEmuMemoryManager(QObject *pParent)
       m_nBits(64),
       m_nMinAddress(0x10000),
       m_nMaxAddress(Q_UINT64_C(0x00007FFFFFFF0000)),
-      m_nCommittedBytes(0)
+      m_nCommittedBytes(0),
+      m_nNextCallbackId(1)
 {
 }
 
@@ -1103,12 +1104,91 @@ void XEmuMemoryManager::setInvalidCallback(const INVALID_CALLBACK &callback)
     m_invalidCallback = callback;
 }
 
+XEmuMemoryManager::CALLBACK_ID XEmuMemoryManager::addReadCallback(
+    const MEM_CALLBACK &callback)
+{
+    static const int N_MAX_SUBSCRIBERS = 1024;
+    if (!callback || m_listReadSubscribers.size() >= N_MAX_SUBSCRIBERS)
+        return 0;
+    CALLBACK_ID nId = m_nNextCallbackId++;
+    if (nId == 0) nId = m_nNextCallbackId++;
+    m_listReadSubscribers.append(MEM_SUBSCRIBER(nId, callback));
+    return nId;
+}
+
+XEmuMemoryManager::CALLBACK_ID XEmuMemoryManager::addWriteCallback(
+    const MEM_CALLBACK &callback)
+{
+    static const int N_MAX_SUBSCRIBERS = 1024;
+    if (!callback || m_listWriteSubscribers.size() >= N_MAX_SUBSCRIBERS)
+        return 0;
+    CALLBACK_ID nId = m_nNextCallbackId++;
+    if (nId == 0) nId = m_nNextCallbackId++;
+    m_listWriteSubscribers.append(MEM_SUBSCRIBER(nId, callback));
+    return nId;
+}
+
+bool XEmuMemoryManager::removeReadCallback(CALLBACK_ID nId)
+{
+    if (nId == 0) return false;
+    for (int i = 0; i < m_listReadSubscribers.size(); ++i) {
+        if (m_listReadSubscribers.at(i).nId == nId) {
+            m_listReadSubscribers.removeAt(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool XEmuMemoryManager::removeWriteCallback(CALLBACK_ID nId)
+{
+    if (nId == 0) return false;
+    for (int i = 0; i < m_listWriteSubscribers.size(); ++i) {
+        if (m_listWriteSubscribers.at(i).nId == nId) {
+            m_listWriteSubscribers.removeAt(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+void XEmuMemoryManager::_fireReadCallbacks(
+    XADDR nAddress, quint32 nSize, quint64 nValue) const
+{
+    // Snapshotting permits a callback to unsubscribe itself without
+    // invalidating this dispatch or changing the subscriber set of the current
+    // event. Own a copy of the legacy function as well: it may clear or replace
+    // its registration while executing. Take both snapshots before invoking it
+    // because a legacy observer may also add/remove subscribers.
+    const MEM_CALLBACK legacy = m_readCallback;
+    const QList<MEM_SUBSCRIBER> subscribers = m_listReadSubscribers;
+    if (legacy) legacy(nAddress, nSize, nValue);
+    for (const MEM_SUBSCRIBER &subscriber : subscribers) {
+        if (subscriber.callback)
+            subscriber.callback(nAddress, nSize, nValue);
+    }
+}
+
+void XEmuMemoryManager::_fireWriteCallbacks(
+    XADDR nAddress, quint32 nSize, quint64 nValue) const
+{
+    const MEM_CALLBACK legacy = m_writeCallback;
+    const QList<MEM_SUBSCRIBER> subscribers = m_listWriteSubscribers;
+    if (legacy) legacy(nAddress, nSize, nValue);
+    for (const MEM_SUBSCRIBER &subscriber : subscribers) {
+        if (subscriber.callback)
+            subscriber.callback(nAddress, nSize, nValue);
+    }
+}
+
 void XEmuMemoryManager::clearCallbacks()
 {
     m_readCallback = nullptr;
     m_writeCallback = nullptr;
     m_codeCallback = nullptr;
     m_invalidCallback = nullptr;
+    m_listReadSubscribers.clear();
+    m_listWriteSubscribers.clear();
 }
 
 void XEmuMemoryManager::fireCodeHook(XADDR nAddress, quint32 nLength) const
@@ -1126,7 +1206,7 @@ quint8 XEmuMemoryManager::readByte(XADDR nAddress, bool *pbOk) const
         *pbOk = bOk;
     }
     if (bOk) {
-        if (m_readCallback) m_readCallback(nAddress, 1, nValue);
+        _fireReadCallbacks(nAddress, 1, nValue);
     } else if (m_invalidCallback) {
         m_invalidCallback(nAddress, 1, false);
     }
@@ -1142,7 +1222,7 @@ quint16 XEmuMemoryManager::readWord(XADDR nAddress, bool *pbOk) const
     }
     nValue = qFromLittleEndian(nValue);
     if (bOk) {
-        if (m_readCallback) m_readCallback(nAddress, 2, nValue);
+        _fireReadCallbacks(nAddress, 2, nValue);
     } else if (m_invalidCallback) {
         m_invalidCallback(nAddress, 2, false);
     }
@@ -1158,7 +1238,7 @@ quint32 XEmuMemoryManager::readDword(XADDR nAddress, bool *pbOk) const
     }
     nValue = qFromLittleEndian(nValue);
     if (bOk) {
-        if (m_readCallback) m_readCallback(nAddress, 4, nValue);
+        _fireReadCallbacks(nAddress, 4, nValue);
     } else if (m_invalidCallback) {
         m_invalidCallback(nAddress, 4, false);
     }
@@ -1174,7 +1254,7 @@ quint64 XEmuMemoryManager::readQword(XADDR nAddress, bool *pbOk) const
     }
     nValue = qFromLittleEndian(nValue);
     if (bOk) {
-        if (m_readCallback) m_readCallback(nAddress, 8, nValue);
+        _fireReadCallbacks(nAddress, 8, nValue);
     } else if (m_invalidCallback) {
         m_invalidCallback(nAddress, 8, false);
     }
@@ -1237,7 +1317,7 @@ bool XEmuMemoryManager::writeByte(XADDR nAddress, quint8 nValue)
 {
     bool bOk = write(nAddress, &nValue, 1);
     if (bOk) {
-        if (m_writeCallback) m_writeCallback(nAddress, 1, nValue);
+        _fireWriteCallbacks(nAddress, 1, nValue);
     } else if (m_invalidCallback) {
         m_invalidCallback(nAddress, 1, true);
     }
@@ -1249,7 +1329,7 @@ bool XEmuMemoryManager::writeWord(XADDR nAddress, quint16 nValue)
     quint16 nLE = qToLittleEndian(nValue);
     bool bOk = write(nAddress, &nLE, 2);
     if (bOk) {
-        if (m_writeCallback) m_writeCallback(nAddress, 2, nValue);
+        _fireWriteCallbacks(nAddress, 2, nValue);
     } else if (m_invalidCallback) {
         m_invalidCallback(nAddress, 2, true);
     }
@@ -1261,7 +1341,7 @@ bool XEmuMemoryManager::writeDword(XADDR nAddress, quint32 nValue)
     quint32 nLE = qToLittleEndian(nValue);
     bool bOk = write(nAddress, &nLE, 4);
     if (bOk) {
-        if (m_writeCallback) m_writeCallback(nAddress, 4, nValue);
+        _fireWriteCallbacks(nAddress, 4, nValue);
     } else if (m_invalidCallback) {
         m_invalidCallback(nAddress, 4, true);
     }
@@ -1273,7 +1353,7 @@ bool XEmuMemoryManager::writeQword(XADDR nAddress, quint64 nValue)
     quint64 nLE = qToLittleEndian(nValue);
     bool bOk = write(nAddress, &nLE, 8);
     if (bOk) {
-        if (m_writeCallback) m_writeCallback(nAddress, 8, nValue);
+        _fireWriteCallbacks(nAddress, 8, nValue);
     } else if (m_invalidCallback) {
         m_invalidCallback(nAddress, 8, true);
     }

@@ -50,7 +50,7 @@ struct XEmuOperand {
     int nScale;      // 1/2/4/8
     qint64 nDisp;    // displacement
     bool bRipRel;    // RIP-relative (address = insn_pc + insn_len + disp)
-    int nSegSource;  // 0 none, 1 FS, 2 GS
+    int nSegSource;  // 0 none, 1 FS, 2 GS, 3 ES, 4 CS, 5 SS, 6 DS
 
     XEmuOperand() : bIsReg(false), bIsMem(false), nReg(0), bHigh8(false), bMMX(false), nBaseReg(-1), nIndexReg(-1), nScale(1), nDisp(0), bRipRel(false), nSegSource(0)
     {
