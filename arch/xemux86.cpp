@@ -45,9 +45,53 @@ const char *const g_pszAluNames[8] = {"add", "or", "adc", "sbb", "and", "sub", "
 #include <windows.h>
 namespace {
 
-// eax=dst(operand-sized), edx=src, cl=count; runs `insn`, returns eax; *pFlags in/out.
-quint32 hostShiftExec(const quint8 *insn, int ilen, quint32 dst, quint32 src, quint8 count, quint32 *pFlags)
+class HostExecPage {
+public:
+    HostExecPage()
+        : m_pPage((quint8 *)VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))
+    {
+    }
+
+    ~HostExecPage()
+    {
+        if (m_pPage) {
+            VirtualFree(m_pPage, 0, MEM_RELEASE);
+        }
+    }
+
+    _Ret_maybenull_ _Post_writable_byte_size_(0x1000) quint8 *data() const
+    {
+        return m_pPage;
+    }
+
+private:
+    HostExecPage(const HostExecPage &) = delete;
+    HostExecPage &operator=(const HostExecPage &) = delete;
+
+    quint8 *m_pPage;
+};
+
+_Ret_maybenull_ _Post_writable_byte_size_(0x1000) quint8 *hostExecPage()
 {
+    // The generated instruction bytes are mutated before every call. Keeping
+    // one page per thread avoids cross-thread publication/execution races.
+    thread_local HostExecPage page;
+    return page.data();
+}
+
+int hostDivExceptionFilter(DWORD nCode)
+{
+    return ((nCode == EXCEPTION_INT_DIVIDE_BY_ZERO) || (nCode == EXCEPTION_INT_OVERFLOW)) ? EXCEPTION_EXECUTE_HANDLER
+                                                                                          : EXCEPTION_CONTINUE_SEARCH;
+}
+
+// eax=dst(operand-sized), edx=src, cl=count; runs `insn`, returns eax; *pFlags in/out.
+bool hostShiftExec(const quint8 *insn, int ilen, quint32 dst, quint32 src, quint8 count, quint32 *pFlags, quint32 *pResult)
+{
+    if (!insn || (ilen <= 0) || !pFlags || !pResult) {
+        return false;
+    }
+
     struct Ctx {
         quint32 eax, ecx, edx, flags;
     };
@@ -57,9 +101,9 @@ quint32 hostShiftExec(const quint8 *insn, int ilen, quint32 dst, quint32 src, qu
     ctx.edx = src;
     ctx.flags = *pFlags;
 
-    static quint8 *page = nullptr;
+    quint8 *page = hostExecPage();
     if (!page) {
-        page = (quint8 *)VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        return false;
     }
     // Only volatile registers (rax/rcx/rdx/r10/r11) are used, so no save/restore is needed.
     static const quint8 pro[] = {
@@ -77,13 +121,19 @@ quint32 hostShiftExec(const quint8 *insn, int ilen, quint32 dst, quint32 src, qu
         0xC3                          // ret
     };
     int i = 0;
+    if ((sizeof(pro) + (size_t)ilen + sizeof(epi)) > 0x1000) {
+        return false;
+    }
     memcpy(page + i, pro, sizeof(pro)); i += (int)sizeof(pro);
     memcpy(page + i, insn, ilen);      i += ilen;
     memcpy(page + i, epi, sizeof(epi)); i += (int)sizeof(epi);
-    FlushInstructionCache(GetCurrentProcess(), page, i);
+    if (!FlushInstructionCache(GetCurrentProcess(), page, i)) {
+        return false;
+    }
     ((void(__fastcall *)(Ctx *))page)(&ctx);
     *pFlags = ctx.flags;
-    return ctx.eax;
+    *pResult = ctx.eax;
+    return true;
 }
 
 // Build the host instruction for a shift op using ax/al (dst), dx (src), cl (count).
@@ -112,8 +162,12 @@ int buildShiftInsn(quint8 *out, int kind, int nSize)
 // Run div/idiv on the host to obtain its (undefined) flags; the emulator keeps its own
 // result. eax=dividend low, edx=dividend high, ecx=divisor. SEH-guarded because the
 // emulator truncates the quotient where the host would raise #DE. Only *pFlags is updated.
-void hostExecDiv(bool bIdiv, int nSize, quint32 eax, quint32 edx, quint32 divisor, quint32 *pFlags)
+bool hostExecDiv(bool bIdiv, int nSize, quint32 eax, quint32 edx, quint32 divisor, quint32 *pFlags)
 {
+    if (!pFlags) {
+        return false;
+    }
+
     struct Ctx {
         quint32 eax, ecx, edx, flags;
     };
@@ -131,9 +185,9 @@ void hostExecDiv(bool bIdiv, int nSize, quint32 eax, quint32 edx, quint32 diviso
     insn[k++] = (nSize == 1) ? 0xF6 : 0xF7;
     insn[k++] = bIdiv ? 0xF9 : 0xF1;  // /7 idiv, /6 div ; rm = ecx/cl
 
-    static quint8 *page = nullptr;
+    quint8 *page = hostExecPage();
     if (!page) {
-        page = (quint8 *)VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        return false;
     }
     static const quint8 pro[] = {
         0x49, 0x89, 0xCB, 0x41, 0x8B, 0x43, 0x0C, 0x50, 0x9D,
@@ -144,13 +198,19 @@ void hostExecDiv(bool bIdiv, int nSize, quint32 eax, quint32 edx, quint32 diviso
     memcpy(page + n, pro, sizeof(pro)); n += (int)sizeof(pro);
     memcpy(page + n, insn, k);          n += k;
     memcpy(page + n, epi, sizeof(epi)); n += (int)sizeof(epi);
-    FlushInstructionCache(GetCurrentProcess(), page, n);
+    if (!FlushInstructionCache(GetCurrentProcess(), page, n)) {
+        return false;
+    }
+    bool bExecuted = false;
     __try {
         ((void(__fastcall *)(Ctx *))page)(&ctx);
         *pFlags = ctx.flags;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        bExecuted = true;
+    } __except (hostDivExceptionFilter(GetExceptionCode())) {
         // Host raised #DE where the emulator truncated; leave flags unchanged.
+        bExecuted = false;
     }
+    return bExecuted;
 }
 
 }  // namespace
@@ -2637,14 +2697,16 @@ quint64 XEmuX86::_doShift(int nShiftOp, quint64 nValue, int nSize, quint8 nCount
         quint8 insn[6];
         const int ilen = buildShiftInsn(insn, nShiftOp, nSize);
         quint32 f = (quint32)m_pExecRegs->nRFLAGS;
-        const quint32 res = hostShiftExec(insn, ilen, (quint32)v, 0, nCnt, &f);
-        m_pExecRegs->setFlag(XEmuRegisters::FLAG_CF, (f & 0x001) != 0);
-        m_pExecRegs->setFlag(XEmuRegisters::FLAG_PF, (f & 0x004) != 0);
-        m_pExecRegs->setFlag(XEmuRegisters::FLAG_AF, (f & 0x010) != 0);
-        m_pExecRegs->setFlag(XEmuRegisters::FLAG_ZF, (f & 0x040) != 0);
-        m_pExecRegs->setFlag(XEmuRegisters::FLAG_SF, (f & 0x080) != 0);
-        m_pExecRegs->setFlag(XEmuRegisters::FLAG_OF, (f & 0x800) != 0);
-        return (quint64)res & nMask;
+        quint32 res = 0;
+        if (hostShiftExec(insn, ilen, (quint32)v, 0, nCnt, &f, &res)) {
+            m_pExecRegs->setFlag(XEmuRegisters::FLAG_CF, (f & 0x001) != 0);
+            m_pExecRegs->setFlag(XEmuRegisters::FLAG_PF, (f & 0x004) != 0);
+            m_pExecRegs->setFlag(XEmuRegisters::FLAG_AF, (f & 0x010) != 0);
+            m_pExecRegs->setFlag(XEmuRegisters::FLAG_ZF, (f & 0x040) != 0);
+            m_pExecRegs->setFlag(XEmuRegisters::FLAG_SF, (f & 0x080) != 0);
+            m_pExecRegs->setFlag(XEmuRegisters::FLAG_OF, (f & 0x800) != 0);
+            return (quint64)res & nMask;
+        }
     }
 #endif
 
@@ -3421,17 +3483,19 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                 quint8 insn[6];
                 const int ilen = buildShiftInsn(insn, (op.nAluOp == 0) ? 100 : 101, 2);
                 quint32 f = (quint32)pRegisters->nRFLAGS;
-                const quint32 res = hostShiftExec(insn, ilen, (quint32)nDst, (quint32)nSrc, nCount, &f);
-                _writeOpnd(op, op.dst, op.nSize, res);
-                if (!m_bExecFault) {
-                    pRegisters->setFlag(XEmuRegisters::FLAG_CF, (f & 0x001) != 0);
-                    pRegisters->setFlag(XEmuRegisters::FLAG_PF, (f & 0x004) != 0);
-                    pRegisters->setFlag(XEmuRegisters::FLAG_AF, (f & 0x010) != 0);
-                    pRegisters->setFlag(XEmuRegisters::FLAG_ZF, (f & 0x040) != 0);
-                    pRegisters->setFlag(XEmuRegisters::FLAG_SF, (f & 0x080) != 0);
-                    pRegisters->setFlag(XEmuRegisters::FLAG_OF, (f & 0x800) != 0);
+                quint32 res = 0;
+                if (hostShiftExec(insn, ilen, (quint32)nDst, (quint32)nSrc, nCount, &f, &res)) {
+                    _writeOpnd(op, op.dst, op.nSize, res);
+                    if (!m_bExecFault) {
+                        pRegisters->setFlag(XEmuRegisters::FLAG_CF, (f & 0x001) != 0);
+                        pRegisters->setFlag(XEmuRegisters::FLAG_PF, (f & 0x004) != 0);
+                        pRegisters->setFlag(XEmuRegisters::FLAG_AF, (f & 0x010) != 0);
+                        pRegisters->setFlag(XEmuRegisters::FLAG_ZF, (f & 0x040) != 0);
+                        pRegisters->setFlag(XEmuRegisters::FLAG_SF, (f & 0x080) != 0);
+                        pRegisters->setFlag(XEmuRegisters::FLAG_OF, (f & 0x800) != 0);
+                    }
+                    break;
                 }
-                break;
             }
 #endif
 
@@ -3754,13 +3818,14 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                 // is already committed above; only the flags are taken from the host).
                 if (op.nSize == 1 || op.nSize == 2 || op.nSize == 4) {
                     quint32 f = (quint32)pRegisters->nRFLAGS;
-                    hostExecDiv(op.nAluOp == 7, op.nSize, nDivEax, nDivEdx, (quint32)(a & nSzMask), &f);
-                    pRegisters->setFlag(XEmuRegisters::FLAG_CF, (f & 0x001) != 0);
-                    pRegisters->setFlag(XEmuRegisters::FLAG_PF, (f & 0x004) != 0);
-                    pRegisters->setFlag(XEmuRegisters::FLAG_AF, (f & 0x010) != 0);
-                    pRegisters->setFlag(XEmuRegisters::FLAG_ZF, (f & 0x040) != 0);
-                    pRegisters->setFlag(XEmuRegisters::FLAG_SF, (f & 0x080) != 0);
-                    pRegisters->setFlag(XEmuRegisters::FLAG_OF, (f & 0x800) != 0);
+                    if (hostExecDiv(op.nAluOp == 7, op.nSize, nDivEax, nDivEdx, (quint32)(a & nSzMask), &f)) {
+                        pRegisters->setFlag(XEmuRegisters::FLAG_CF, (f & 0x001) != 0);
+                        pRegisters->setFlag(XEmuRegisters::FLAG_PF, (f & 0x004) != 0);
+                        pRegisters->setFlag(XEmuRegisters::FLAG_AF, (f & 0x010) != 0);
+                        pRegisters->setFlag(XEmuRegisters::FLAG_ZF, (f & 0x040) != 0);
+                        pRegisters->setFlag(XEmuRegisters::FLAG_SF, (f & 0x080) != 0);
+                        pRegisters->setFlag(XEmuRegisters::FLAG_OF, (f & 0x800) != 0);
+                    }
                 }
 #endif
             }
