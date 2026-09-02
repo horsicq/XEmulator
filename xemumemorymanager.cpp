@@ -514,11 +514,19 @@ bool XEmuMemoryManager::commit(XADDR nAddress, quint64 nSize, const MEMORY_FLAGS
         return false;
     }
     const quint64 nOriginalCommittedBytes = m_nCommittedBytes;
-    const auto rollback = [&]() -> bool {
-        m_listRegions.swap(listOriginal);
-        m_nCommittedBytes = nOriginalCommittedBytes;
-        return false;
+    struct COMMIT_ROLLBACK {
+        QList<REGION> *pRegions;
+        QList<REGION> *pOriginalRegions;
+        quint64 *pCommittedBytes;
+        quint64 nOriginalCommittedBytes;
+        bool operator()() const
+        {
+            pRegions->swap(*pOriginalRegions);
+            *pCommittedBytes = nOriginalCommittedBytes;
+            return false;
+        }
     };
+    const COMMIT_ROLLBACK rollback = {&m_listRegions, &listOriginal, &m_nCommittedBytes, nOriginalCommittedBytes};
 
     try {
         _coalesce();
@@ -736,10 +744,16 @@ bool XEmuMemoryManager::protect(XADDR nAddress, quint64 nSize, const MEMORY_FLAG
         emit errorMessage(tr("Cannot snapshot the memory map for a transactional protection change"));
         return false;
     }
-    const auto rollback = [&]() -> bool {
-        m_listRegions.swap(listOriginal);
-        return false;
+    struct PROTECT_ROLLBACK {
+        QList<REGION> *pRegions;
+        QList<REGION> *pOriginalRegions;
+        bool operator()() const
+        {
+            pRegions->swap(*pOriginalRegions);
+            return false;
+        }
     };
+    const PROTECT_ROLLBACK rollback = {&m_listRegions, &listOriginal};
 
     try {
         XADDR nCursor = nStart;

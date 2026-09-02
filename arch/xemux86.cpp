@@ -25,6 +25,70 @@
 
 namespace {
 const char *const g_pszAluNames[8] = {"add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"};
+
+double readF80Value(XEmuMemoryManager *pMemoryManager, XADDR nAddress)
+{
+    quint64 nMantissa = 0;
+    for (int i = 0; i < 8; i++) {
+        nMantissa |= static_cast<quint64>(pMemoryManager->readByte(nAddress + i)) << (i * 8);
+    }
+    const quint16 nSignedExponent = static_cast<quint16>(pMemoryManager->readByte(nAddress + 8) | (pMemoryManager->readByte(nAddress + 9) << 8));
+    const int nSign = (nSignedExponent >> 15) & 1;
+    const int nExponent = nSignedExponent & 0x7FFF;
+    if ((nExponent == 0) && (nMantissa == 0)) return nSign ? -0.0 : 0.0;
+    const double nValue = std::ldexp(static_cast<double>(nMantissa), nExponent - 16383 - 63);
+    return nSign ? -nValue : nValue;
+}
+
+void writeF80Value(XEmuMemoryManager *pMemoryManager, XADDR nAddress, double nValue)
+{
+    quint64 nMantissa = 0;
+    quint16 nSignedExponent = 0;
+    if ((nValue != 0.0) && !std::isnan(nValue) && !std::isinf(nValue)) {
+        const int nSign = std::signbit(nValue) ? 1 : 0;
+        const double nMagnitude = std::fabs(nValue);
+        int nExponent = 0;
+        const double nFraction = std::frexp(nMagnitude, &nExponent);
+        nMantissa = static_cast<quint64>(std::ldexp(nFraction, 64));
+        nSignedExponent = static_cast<quint16>((nSign << 15) | ((nExponent - 1 + 16383) & 0x7FFF));
+    }
+    for (int i = 0; i < 8; i++) {
+        pMemoryManager->writeByte(nAddress + i, static_cast<quint8>(nMantissa >> (i * 8)));
+    }
+    pMemoryManager->writeByte(nAddress + 8, static_cast<quint8>(nSignedExponent & 0xFF));
+    pMemoryManager->writeByte(nAddress + 9, static_cast<quint8>(nSignedExponent >> 8));
+}
+
+double fpuArithmetic(int nSelector, double nFirst, double nSecond)
+{
+    switch (nSelector) {
+        case 0: return nFirst + nSecond;
+        case 1: return nFirst * nSecond;
+        case 4: return nFirst - nSecond;
+        case 5: return nSecond - nFirst;
+        case 6: return nFirst / nSecond;
+        case 7: return nSecond / nFirst;
+    }
+    return nFirst;
+}
+
+quint64 wrapNearBranch(quint8 nBits, quint64 nCodeSegmentBase, quint64 nLinearTarget)
+{
+    return (nBits == 16) ? (nCodeSegmentBase + ((nLinearTarget - nCodeSegmentBase) & 0xFFFF)) : nLinearTarget;
+}
+
+void setAxBytes(XEmuRegisters *pRegisters, quint8 nAl, quint8 nAh)
+{
+    pRegisters->setGPR(XEmuRegisters::GPR_RAX, 2, static_cast<quint16>((nAh << 8) | nAl));
+}
+
+void dumpMemoryOperand(const char *pWhich, const XEmuOperand &operand)
+{
+    if (operand.bIsMem) {
+        fprintf(stderr, "  %s: mem base=%d index=%d scale=%d disp=%lld seg=%d\n", pWhich, operand.nBaseReg, operand.nIndexReg, operand.nScale,
+                static_cast<long long>(operand.nDisp), operand.nSegSource);
+    }
+}
 }
 
 // ---- host-CPU native shift fallback (x86-64 host only) --------------------------------
@@ -2226,114 +2290,82 @@ void XEmuX86::_execFpu(const XEmuMicroOp &op)
 
     XADDR nAddr = bMem ? _resolveAddr(op, op.dst) : 0;
 
-    // ---- typed 80-bit extended <-> double ------------------------------------
-    auto readF80 = [&](XADDR a) -> double {
-        quint64 nMant = 0;
-        for (int i = 0; i < 8; i++) {
-            nMant |= (quint64)m_pMemoryManager->readByte(a + i) << (i * 8);
-        }
-        quint16 nSExp = (quint16)(m_pMemoryManager->readByte(a + 8) | (m_pMemoryManager->readByte(a + 9) << 8));
-        int nSign = (nSExp >> 15) & 1;
-        int nExp = nSExp & 0x7FFF;
-        if (nExp == 0 && nMant == 0) {
-            return nSign ? -0.0 : 0.0;
-        }
-        double v = std::ldexp((double)nMant, nExp - 16383 - 63);  // mantissa has an explicit integer bit
-        return nSign ? -v : v;
-    };
-    auto writeF80 = [&](XADDR a, double v) {
-        quint64 nMant = 0;
-        quint16 nSExp = 0;
-        if (v != 0.0 && !std::isnan(v) && !std::isinf(v)) {
-            int nSign = std::signbit(v) ? 1 : 0;
-            double m = std::fabs(v);
-            int e = 0;
-            double frac = std::frexp(m, &e);       // m = frac * 2^e, frac in [0.5,1)
-            nMant = (quint64)std::ldexp(frac, 64);  // 64-bit mantissa with explicit leading bit
-            nSExp = (quint16)((nSign << 15) | ((e - 1 + 16383) & 0x7FFF));
-        }
-        for (int i = 0; i < 8; i++) {
-            m_pMemoryManager->writeByte(a + i, (quint8)(nMant >> (i * 8)));
-        }
-        m_pMemoryManager->writeByte(a + 8, (quint8)(nSExp & 0xFF));
-        m_pMemoryManager->writeByte(a + 9, (quint8)(nSExp >> 8));
-    };
-    auto readMem = [&]() -> double {
-        switch (op.nSrcSize) {
+    struct FPU_MEMORY_ACCESS {
+        XEmuX86 *pOwner;
+        const XEmuMicroOp *pOperation;
+        XADDR nAddress;
+
+        double readReal() const
+        {
+            switch (pOperation->nSrcSize) {
             case 1: {
-                quint32 b = (quint32)_memReadSized(nAddr, 4);
+                quint32 b = (quint32)pOwner->_memReadSized(nAddress, 4);
                 float f;
                 memcpy(&f, &b, 4);
                 return (double)f;
             }
             case 2: {
-                quint64 b = _memReadSized(nAddr, 8);
+                quint64 b = pOwner->_memReadSized(nAddress, 8);
                 double d;
                 memcpy(&d, &b, 8);
                 return d;
             }
-            case 3: return readF80(nAddr);
-            case 4: return (double)(qint16)(quint16)_memReadSized(nAddr, 2);
-            case 5: return (double)(qint32)(quint32)_memReadSized(nAddr, 4);
-            case 6: return (double)(qint64)_memReadSized(nAddr, 8);
+            case 3: return readF80Value(pOwner->m_pMemoryManager, nAddress);
+            case 4: return (double)(qint16)(quint16)pOwner->_memReadSized(nAddress, 2);
+            case 5: return (double)(qint32)(quint32)pOwner->_memReadSized(nAddress, 4);
+            case 6: return (double)(qint64)pOwner->_memReadSized(nAddress, 8);
+            }
+            return 0.0;
         }
-        return 0.0;
-    };
-    auto writeMem = [&](double v) {
-        switch (op.nSrcSize) {
+
+        void writeReal(double v) const
+        {
+            switch (pOperation->nSrcSize) {
             case 1: {
                 float f = (float)v;
                 quint32 b;
                 memcpy(&b, &f, 4);
-                _memWriteSized(nAddr, b, 4);
+                pOwner->_memWriteSized(nAddress, b, 4);
                 break;
             }
             case 2: {
                 quint64 b;
                 memcpy(&b, &v, 8);
-                _memWriteSized(nAddr, b, 8);
+                pOwner->_memWriteSized(nAddress, b, 8);
                 break;
             }
-            case 3: writeF80(nAddr, v); break;
-            case 4: _memWriteSized(nAddr, (quint64)(qint16)std::llround(v), 2); break;
-            case 5: _memWriteSized(nAddr, (quint64)(qint32)std::llround(v), 4); break;
-            case 6: _memWriteSized(nAddr, (quint64)(qint64)std::llround(v), 8); break;
+            case 3: writeF80Value(pOwner->m_pMemoryManager, nAddress, v); break;
+            case 4: pOwner->_memWriteSized(nAddress, (quint64)(qint16)std::llround(v), 2); break;
+            case 5: pOwner->_memWriteSized(nAddress, (quint64)(qint32)std::llround(v), 4); break;
+            case 6: pOwner->_memWriteSized(nAddress, (quint64)(qint64)std::llround(v), 8); break;
+            }
         }
-    };
-    // Exact-integer FILD source (m16/m32/m64 int), sign-extended to 64 bits.
-    auto readMemInt = [&]() -> qint64 {
-        switch (op.nSrcSize) {
-            case 4: return (qint64)(qint16)(quint16)_memReadSized(nAddr, 2);
-            case 5: return (qint64)(qint32)(quint32)_memReadSized(nAddr, 4);
-            case 6: return (qint64)_memReadSized(nAddr, 8);
-        }
-        return 0;
-    };
-    // FIST/FISTP store: if ST(0) still holds an exact integer (FILD with no intervening
-    // arithmetic), store it losslessly; otherwise round the double as before. Real x87 has a
-    // 64-bit mantissa, so a round-tripped 64-bit integer is unchanged -- the double model
-    // would silently corrupt values above 2^53 (a known packer anti-emulation probe).
-    auto storeTopInt = [&]() {
-        const qint64 iv = m_fpuIsInt[m_fpuTop] ? m_fpuInt[m_fpuTop] : (qint64)std::llround(_fpuGet(0));
-        switch (op.nSrcSize) {
-            case 4: _memWriteSized(nAddr, (quint64)(quint16)(qint16)iv, 2); break;
-            case 5: _memWriteSized(nAddr, (quint64)(quint32)(qint32)iv, 4); break;
-            case 6: _memWriteSized(nAddr, (quint64)iv, 8); break;
-        }
-    };
 
-    // reg-form arithmetic op selector shared by 0xD8/0xDC/0xDE.
-    auto arith = [&](int nSel, double a, double b) -> double {
-        switch (nSel) {
-            case 0: return a + b;  // FADD
-            case 1: return a * b;  // FMUL
-            case 4: return a - b;  // FSUB
-            case 5: return b - a;  // FSUBR
-            case 6: return a / b;  // FDIV
-            case 7: return b / a;  // FDIVR
+        qint64 readInteger() const
+        {
+            switch (pOperation->nSrcSize) {
+            case 4: return (qint64)(qint16)(quint16)pOwner->_memReadSized(nAddress, 2);
+            case 5: return (qint64)(qint32)(quint32)pOwner->_memReadSized(nAddress, 4);
+            case 6: return (qint64)pOwner->_memReadSized(nAddress, 8);
+            }
+            return 0;
         }
-        return a;
+
+        void storeTopInteger() const
+        {
+            // Keep exact FILD values lossless across FIST/FISTP stores. The double model
+            // would otherwise corrupt integer values above 2^53.
+            const qint64 iv = pOwner->m_fpuIsInt[pOwner->m_fpuTop]
+                                  ? pOwner->m_fpuInt[pOwner->m_fpuTop]
+                                  : (qint64)std::llround(pOwner->_fpuGet(0));
+            switch (pOperation->nSrcSize) {
+            case 4: pOwner->_memWriteSized(nAddress, (quint64)(quint16)(qint16)iv, 2); break;
+            case 5: pOwner->_memWriteSized(nAddress, (quint64)(quint32)(qint32)iv, 4); break;
+            case 6: pOwner->_memWriteSized(nAddress, (quint64)iv, 8); break;
+            }
+        }
     };
+    const FPU_MEMORY_ACCESS fpuMemoryAccess = {this, &op, nAddr};
 
     if (bMem) {
         switch (nOpcode) {
@@ -2341,20 +2373,20 @@ void XEmuX86::_execFpu(const XEmuMicroOp &op)
             case 0xDC:  // arith ST(0), m64real
             case 0xDA:  // arith ST(0), m32int
             case 0xDE: {  // arith ST(0), m16int
-                double m = readMem();
+                double m = fpuMemoryAccess.readReal();
                 if (nReg == 2 || nReg == 3) {  // FCOM / FCOMP
                     _fpuCompare(_fpuGet(0), m, false);
                     if (nReg == 3) _fpuPop();
                 } else {
-                    _fpuSet(0, arith(nReg, _fpuGet(0), m));
+                    _fpuSet(0, fpuArithmetic(nReg, _fpuGet(0), m));
                 }
                 break;
             }
             case 0xD9:  // FLD m32 / FST/FSTP m32 / FLDCW / FNSTCW / FLDENV / FNSTENV
                 if (nReg == 0) {
-                    _fpuPush(readMem());
+                    _fpuPush(fpuMemoryAccess.readReal());
                 } else if (nReg == 2 || nReg == 3) {
-                    writeMem(_fpuGet(0));
+                    fpuMemoryAccess.writeReal(_fpuGet(0));
                     if (nReg == 3) _fpuPop();
                 } else if (nReg == 5) {  // FLDCW
                     m_fpuControl = (quint16)_memReadSized(nAddr, 2);
@@ -2365,22 +2397,22 @@ void XEmuX86::_execFpu(const XEmuMicroOp &op)
                 break;
             case 0xDB:  // FILD m32 / FISTP m32 / FLD m80 / FSTP m80
                 if (nReg == 0) {
-                    _fpuPushInt(readMemInt());  // FILD m32int (exact)
+                    _fpuPushInt(fpuMemoryAccess.readInteger());  // FILD m32int (exact)
                 } else if (nReg == 2 || nReg == 3) {
-                    storeTopInt();  // FIST/FISTP m32int (exact when integer-valued)
+                    fpuMemoryAccess.storeTopInteger();  // FIST/FISTP m32int (exact when integer-valued)
                     if (nReg == 3) _fpuPop();
                 } else if (nReg == 5) {
-                    _fpuPush(readMem());  // FLD m80real
+                    _fpuPush(fpuMemoryAccess.readReal());  // FLD m80real
                 } else if (nReg == 7) {
-                    writeMem(_fpuGet(0));  // FSTP m80real
+                    fpuMemoryAccess.writeReal(_fpuGet(0));  // FSTP m80real
                     _fpuPop();
                 }
                 break;
             case 0xDD:  // FLD m64 / FST/FSTP m64 / FNSTSW m16 / FRSTOR / FNSAVE
                 if (nReg == 0) {
-                    _fpuPush(readMem());
+                    _fpuPush(fpuMemoryAccess.readReal());
                 } else if (nReg == 2 || nReg == 3) {
-                    writeMem(_fpuGet(0));
+                    fpuMemoryAccess.writeReal(_fpuGet(0));
                     if (nReg == 3) _fpuPop();
                 } else if (nReg == 7) {  // FNSTSW m16
                     _memWriteSized(nAddr, _fpuStatusWord(), 2);
@@ -2388,12 +2420,12 @@ void XEmuX86::_execFpu(const XEmuMicroOp &op)
                 break;
             case 0xDF:  // FILD m16/m64 / FISTP m16/m64
                 if (nReg == 0 || nReg == 5) {
-                    _fpuPushInt(readMemInt());  // FILD m16int / m64int (exact)
+                    _fpuPushInt(fpuMemoryAccess.readInteger());  // FILD m16int / m64int (exact)
                 } else if (nReg == 2 || nReg == 3) {
-                    storeTopInt();  // FIST/FISTP m16int (exact when integer-valued)
+                    fpuMemoryAccess.storeTopInteger();  // FIST/FISTP m16int (exact when integer-valued)
                     if (nReg == 3) _fpuPop();
                 } else if (nReg == 7) {
-                    storeTopInt();  // FISTP m64int (exact when integer-valued)
+                    fpuMemoryAccess.storeTopInteger();  // FISTP m64int (exact when integer-valued)
                     _fpuPop();
                 }
                 break;
@@ -2409,7 +2441,7 @@ void XEmuX86::_execFpu(const XEmuMicroOp &op)
                 _fpuCompare(_fpuGet(0), _fpuGet(i), false);
                 if (nReg == 3) _fpuPop();
             } else {
-                _fpuSet(0, arith(nReg, _fpuGet(0), _fpuGet(i)));
+                _fpuSet(0, fpuArithmetic(nReg, _fpuGet(0), _fpuGet(i)));
             }
             break;
         case 0xDC:  // arith ST(i), ST(0)  (reversed operand order for SUB/DIV)
@@ -2862,8 +2894,6 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
     // In 16-bit real mode a near relative branch wraps within the 64 KiB code segment: the
     // target offset is taken modulo 0x10000 before the segment base is re-applied, so a large
     // negative displacement can't underflow below the segment (crossing into unmapped memory).
-    auto branchWrap = [&](quint64 nLinearTarget) -> quint64 { return (m_nBits == 16) ? (nCodeSegBase + ((nLinearTarget - nCodeSegBase) & 0xFFFF)) : nLinearTarget; };
-
     switch (op.kind) {
         case MOP_NOP:
             break;
@@ -2945,15 +2975,15 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
             }
             break;
         case MOP_JMP:
-            pRegisters->nRIP = branchWrap(op.nBranchTarget);
+            pRegisters->nRIP = wrapNearBranch(m_nBits, nCodeSegBase, op.nBranchTarget);
             bBranch = true;
             break;
         case MOP_JMP_IND:
-            pRegisters->nRIP = branchWrap(nCodeSegBase + _readOpnd(op, op.src, op.nSize));
+            pRegisters->nRIP = wrapNearBranch(m_nBits, nCodeSegBase, nCodeSegBase + _readOpnd(op, op.src, op.nSize));
             bBranch = true;
             break;
         case MOP_JCC:
-            pRegisters->nRIP = _evalCond(op.nCond) ? branchWrap(op.nBranchTarget) : nFall;
+            pRegisters->nRIP = _evalCond(op.nCond) ? wrapNearBranch(m_nBits, nCodeSegBase, op.nBranchTarget) : nFall;
             bBranch = true;
             break;
         case MOP_CALL:
@@ -2962,11 +2992,11 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
             // base is a multiple of 64 KiB (CS a multiple of 0x1000) -- broken once code runs at
             // a relocated segment like 0x13E7, so push the segment-relative offset in 16-bit mode.
             _push((m_nBits == 16) ? (nFall - nCodeSegBase) : nFall, nPtrSize);
-            pRegisters->nRIP = branchWrap(op.nBranchTarget);
+            pRegisters->nRIP = wrapNearBranch(m_nBits, nCodeSegBase, op.nBranchTarget);
             bBranch = true;
             break;
         case MOP_CALL_IND: {
-            quint64 nTarget = branchWrap(nCodeSegBase + _readOpnd(op, op.src, op.nSize));
+            quint64 nTarget = wrapNearBranch(m_nBits, nCodeSegBase, nCodeSegBase + _readOpnd(op, op.src, op.nSize));
             _push((m_nBits == 16) ? (nFall - nCodeSegBase) : nFall, nPtrSize);
             pRegisters->nRIP = nTarget;
             bBranch = true;
@@ -3366,8 +3396,6 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
             quint8 nAH = (quint8)((pRegisters->getGPR(XEmuRegisters::GPR_RAX, 2) >> 8) & 0xFF);
             bool bCF = pRegisters->getFlag(XEmuRegisters::FLAG_CF);
             bool bAF = pRegisters->getFlag(XEmuRegisters::FLAG_AF);
-            auto setAX = [&](quint8 al, quint8 ah) { pRegisters->setGPR(XEmuRegisters::GPR_RAX, 2, (quint16)((ah << 8) | al)); };
-
             switch (op.nAluOp) {
                 case 0:    // DAA
                 case 1: {  // DAS
@@ -3413,14 +3441,14 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                 }
                 case 4: {  // AAM: AH = AL / base, AL = AL % base
                     quint8 nBase = (quint8)op.nImm ? (quint8)op.nImm : 10;
-                    setAX((quint8)(nAL % nBase), (quint8)(nAL / nBase));
+                    setAxBytes(pRegisters, static_cast<quint8>(nAL % nBase), static_cast<quint8>(nAL / nBase));
                     _setFlagsLogic((quint8)(nAL % nBase), 1);
                     break;
                 }
                 case 5: {  // AAD: AL = (AL + AH*base) & 0xFF, AH = 0
                     quint8 nBase = (quint8)op.nImm ? (quint8)op.nImm : 10;
                     quint8 nRes = (quint8)(nAL + nAH * nBase);
-                    setAX(nRes, 0);
+                    setAxBytes(pRegisters, nRes, 0);
                     _setFlagsLogic(nRes, 1);
                     break;
                 }
@@ -3960,7 +3988,7 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                     bJump = (nCount != 0);  // loop
                 }
             }
-            pRegisters->nRIP = bJump ? branchWrap(op.nBranchTarget) : nFall;
+            pRegisters->nRIP = bJump ? wrapNearBranch(m_nBits, nCodeSegBase, op.nBranchTarget) : nFall;
             bBranch = true;
             break;
         }
@@ -4014,14 +4042,8 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                     (unsigned long long)pRegisters->nRIP,
                     op.sText.toLatin1().constData(),
                     (unsigned long long)m_nFaultAddr);
-            auto dumpMem = [&](const char *sWhich, const XEmuOperand &o) {
-                if (o.bIsMem) {
-                    fprintf(stderr, "  %s: mem base=%d index=%d scale=%d disp=%lld seg=%d\n",
-                            sWhich, o.nBaseReg, o.nIndexReg, o.nScale, (long long)o.nDisp, o.nSegSource);
-                }
-            };
-            dumpMem("dst", op.dst);
-            dumpMem("src", op.src);
+            dumpMemoryOperand("dst", op.dst);
+            dumpMemoryOperand("src", op.src);
             static const char *asName[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
             for (int i = 0; i < 8; i++) {
                 fprintf(stderr, "  %s=%08llx", asName[i], (unsigned long long)pRegisters->getGPR(i, 4));
