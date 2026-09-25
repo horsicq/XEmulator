@@ -28,5 +28,18 @@ XEmuELF::XEmuELF(QObject *pParent) : XEmuGenericFormat(pParent)
 
 XBinary *XEmuELF::createBinary(QIODevice *pDevice)
 {
-    return new XELF(pDevice);
+    XELF probe(pDevice);
+    const quint16 type = probe.is64() ? probe.getHdr64_type() : probe.getHdr32_type();
+    XADDR base = 0;
+    if (type == XELF_DEF::S_ET_EXEC) {
+        const QList<XELF_DEF::Elf_Phdr> headers = probe.getElf_PhdrList(128);
+        for (const XELF_DEF::Elf_Phdr &header : headers) {
+            if (header.p_type == XELF_DEF::S_PT_LOAD &&
+                (base == 0 || header.p_vaddr < base)) {
+                base = XEmuMemoryManager::alignDown(header.p_vaddr,
+                                                    XEmuMemoryManager::N_PAGE_SIZE);
+            }
+        }
+    }
+    return new XELF(pDevice, false, base);
 }

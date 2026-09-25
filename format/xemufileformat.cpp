@@ -45,7 +45,7 @@ bool XEmuFileFormat::mapByMemoryMap(XBinary *pBinary, XEmuMemoryManager *pMemory
     XADDR nMaxEnd = nPreferredBase;
     for (int i = 0; i < memoryMap.listRecords.count(); i++) {
         const XBinary::_MEMORY_RECORD &record = memoryMap.listRecords.at(i);
-        if (record.nSize <= 0 || record.nAddress < nPreferredBase) {
+        if (record.nSize <= 0 || record.nAddress == XADDR_MAX || record.nAddress < nPreferredBase) {
             continue;
         }
         const quint64 nRecordSize =
@@ -103,7 +103,7 @@ bool XEmuFileFormat::mapByMemoryMap(XBinary *pBinary, XEmuMemoryManager *pMemory
 
         // Only map records that fall inside the reserved image (guards against
         // malformed / overlay records with out-of-range addresses).
-        if ((record.nSize <= 0) || (record.nAddress < nPreferredBase)) {
+        if ((record.nSize <= 0) || (record.nAddress == XADDR_MAX) || (record.nAddress < nPreferredBase)) {
             continue;
         }
         quint64 nOffsetInImage = record.nAddress - nPreferredBase;

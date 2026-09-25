@@ -23,6 +23,7 @@
 
 #include "xemuoperatingsystem.h"
 #include "xemusyscalls.h"
+#include <QStringList>
 
 // Shared base for the Unix-family personalities (Linux, FreeBSD, macOS). Maps the
 // main image, lays out a thread stack with the initial process vector and sets the
@@ -58,6 +59,7 @@ protected:
     bool m_bIs64;
     XEmuArchType m_archType;
     XEmuSyscalls *m_pSyscalls;  // emulated syscall layer (personality-specific)
+    QStringList m_guestArguments;
 };
 
 #endif  // XEMUUNIXOS_H

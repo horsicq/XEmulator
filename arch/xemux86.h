@@ -22,6 +22,7 @@
 #define XEMUX86_H
 
 #include "xemuarch.h"
+#include <QHash>
 #include <QSet>
 
 #include "xemutb.h"
@@ -41,6 +42,11 @@ public:
     XEmuArchType getArchType() const override;
     quint8 getBits() const override;
     void setBits(quint8 nBits) override;
+    void setProtectedMode(bool enabled);
+    bool isProtectedMode() const { return m_bProtectedMode; }
+    void setSelectorDescriptor(quint16 selector, XADDR base, quint32 limit, bool default32);
+    XADDR selectorBase(quint16 selector) const;
+    bool selectorDefault32(quint16 selector) const;
 
     STEP_INFO step(XEmuRegisters *pRegisters) override;
     XADDR getFaultAddress() const override { return m_nFaultAddr; }
@@ -100,6 +106,7 @@ private:
     void _decodeTwoByte(DEC &dec, XEmuMicroOp &op);
     void _decodeFpu(DEC &dec, XEmuMicroOp &op, quint8 nOpcode);  // x87 ESC opcodes 0xD8..0xDF
     bool _decodeMMX(DEC &dec, XEmuMicroOp &op, quint8 nOpcode);  // MMX 0F opcodes; returns true if handled
+    bool _decodeSSE(DEC &dec, XEmuMicroOp &op, quint8 nOpcode);
     XEmuTB *_translateBlock(XADDR nAddress);
     int _stackSize(const DEC &dec) const;
 
@@ -135,7 +142,7 @@ private:
     // reach memory *below* their segment by subtracting from the segment (e.g. AVPack copies with
     // DS=F5BA/SI=FFFE, i.e. linear 0x105B9E -> 0x005B9E). Without the wrap those accesses land in
     // the >1 MiB region and the program silently reads/writes the wrong memory.
-    XADDR _wrapA20(XADDR nAddress) const { return (m_nBits == 16) ? (nAddress & 0xFFFFF) : nAddress; }
+    XADDR _wrapA20(XADDR nAddress) const { return (m_nBits == 16 && !m_bProtectedMode) ? (nAddress & 0xFFFFF) : nAddress; }
     quint64 _memReadSized(XADDR nAddress, int nSize);              // sets m_bExecFault on fault
     void _memWriteSized(XADDR nAddress, quint64 nValue, int nSize);  // sets m_bExecFault on fault
     quint64 _aluCompute(int nAluOp, quint64 a, quint64 b, int nSize, bool &bWriteBack);
@@ -155,6 +162,13 @@ private:
     static qint64 _signExtend(quint64 nValue, int nSize);
 
     quint8 m_nBits;
+    struct SelectorDescriptor {
+        XADDR base = 0;
+        quint32 limit = 0xffffu;
+        bool default32 = false;
+    };
+    bool m_bProtectedMode = false;
+    QHash<quint16, SelectorDescriptor> m_selectors;
     quint64 m_nTsc;
     quint8 m_ioPorts[0x400];  // stateful low-ISA I/O ports (PIC/PIT/keyboard) so anti-debug
                               // "read mask / modify / write it back" games stay self-consistent

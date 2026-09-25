@@ -21,6 +21,8 @@
 #include "xemuunixos.h"
 
 #include <functional>
+#include <QProcess>
+#include <QVector>
 
 #include "linux_syscalls/xemulinuxsyscalls.h"
 
@@ -123,13 +125,21 @@ XADDR XEmuUnixOS::buildInitialStack(XEmuFileFormat *pMainFormat, const XEmuFileF
 
     int nPtr = _ptrSize();
 
-    // Program-name string plus 16 "random" bytes (AT_RANDOM) near the stack top.
-    QByteArray baName = mainModule.sName.toUtf8();
-    baName.append('\0');
-    XADDR nNameAddress = XEmuMemoryManager::alignDown(nStackTop - 0x200, 16);
-    m_pMemoryManager->write(nNameAddress, baName);
-
-    XADDR nRandomAddress = XEmuMemoryManager::alignDown(nNameAddress - 16, 16);
+    // Place argv strings and AT_RANDOM above the initial pointer vector.
+    QStringList arguments;
+    arguments.append(mainModule.sFileName);
+    arguments.append(m_guestArguments);
+    QVector<XADDR> argAddresses;
+    XADDR nStringCursor = nStackTop - 0x100;
+    for (const QString &argument : arguments) {
+        QByteArray bytes = argument.toUtf8();
+        bytes.append('\0');
+        nStringCursor = XEmuMemoryManager::alignDown(nStringCursor - bytes.size(), nPtr);
+        m_pMemoryManager->write(nStringCursor, bytes);
+        argAddresses.append(nStringCursor);
+    }
+    XADDR nNameAddress = argAddresses.first();
+    XADDR nRandomAddress = XEmuMemoryManager::alignDown(nStringCursor - 16, 16);
     m_pMemoryManager->write(nRandomAddress, QByteArray(16, 0x5A));
 
     // Recover the program-header table location from the ELF file header; a packer
@@ -174,7 +184,7 @@ XADDR XEmuUnixOS::buildInitialStack(XEmuFileFormat *pMainFormat, const XEmuFileF
                 {31, nNameAddress},
                 {0, 0}};
 
-    int nSlots = 1 /*argc*/ + 1 /*argv0*/ + 1 /*argv null*/ + 1 /*envp null*/ + (int)(sizeof(auxv) / sizeof(auxv[0])) * 2;
+    int nSlots = 1 /*argc*/ + argAddresses.size() + 1 /*argv null*/ + 1 /*envp null*/ + (int)(sizeof(auxv) / sizeof(auxv[0])) * 2;
     XADDR nSp = XEmuMemoryManager::alignDown(nRandomAddress - (XADDR)nSlots * nPtr, 16);
 
     // The System V ABI requires (argc pointer) % 16 == 0 after argc is pushed; keep
@@ -184,10 +194,12 @@ XADDR XEmuUnixOS::buildInitialStack(XEmuFileFormat *pMainFormat, const XEmuFileF
     }
 
     XADDR nCursor = nSp;
-    _pushPtr(nCursor, 1);
+    _pushPtr(nCursor, argAddresses.size());
     nCursor += nPtr;  // argc
-    _pushPtr(nCursor, nNameAddress);
-    nCursor += nPtr;  // argv[0]
+    for (XADDR nArgAddress : argAddresses) {
+        _pushPtr(nCursor, nArgAddress);
+        nCursor += nPtr;
+    }
     _pushPtr(nCursor, 0);
     nCursor += nPtr;  // argv NULL
     _pushPtr(nCursor, 0);
@@ -213,6 +225,7 @@ bool XEmuUnixOS::setupProcess(XEmuFileFormat *pMainFormat, XEmuRegisters *pRegis
 
     m_archType = pMainFormat->getArchType();
     m_bIs64 = (xemuArchBits(m_archType) == 64);
+    m_guestArguments = QProcess::splitCommand(options.sCommandLine).mid(0, 128);
 
     m_pMemoryManager->clear();
     m_pMemoryManager->setBits(m_bIs64 ? 64 : 32);
@@ -224,7 +237,10 @@ bool XEmuUnixOS::setupProcess(XEmuFileFormat *pMainFormat, XEmuRegisters *pRegis
     m_pSyscalls = createSyscalls();
     m_pSyscalls->setLogger(std::bind(&XEmuUnixOS::_forwardSyscallLog, this, std::placeholders::_1));
     m_pSyscalls->reset();
-    m_pSyscalls->setSelfExe(m_baImageFile, QString());
+    m_pSyscalls->setSelfExe(m_baImageFile, options.sProgramName);
+    if (XEmuLinuxSyscalls *linux = dynamic_cast<XEmuLinuxSyscalls *>(m_pSyscalls)) {
+        linux->setWorkingDirectory(options.sWorkingDirectory);
+    }
 
     XADDR nBase = _chooseBase(pMainFormat);
     if (nBase == 0) {

@@ -29,6 +29,7 @@
 
 class XEmuBiosInt;
 class XEmuMsdosInt;
+class XEmuDpmi;
 
 // MS-DOS personality for MZ / COM executables (16-bit x86 real mode). Maps the load
 // module, builds a PSP and sets the real-mode segment registers (CS:IP, SS:SP,
@@ -99,6 +100,7 @@ private:
 
     XEmuBiosInt *m_pBiosInt;
     XEmuMsdosInt *m_pMsdosInt;
+    XEmuDpmi *m_pDpmiHost;
     QByteArray m_baLine;  // pending output not yet ended by a newline
     int m_nCurRow;
     int m_nCurCol;

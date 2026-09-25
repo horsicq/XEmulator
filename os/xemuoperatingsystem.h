@@ -41,8 +41,8 @@ public:
         QString sSystemRoot;       // directory searched for dependency modules
         quint64 nStackSize;        // thread stack size
         bool bLoadDependencies;
-        QString sCommandLine;      // program arguments (DOS: written to the PSP command tail)
-        QString sWorkingDirectory; // DOS current directory: base for INT 21h file I/O paths
+        QString sCommandLine;      // guest arguments (DOS PSP tail / Windows GetCommandLine)
+        QString sWorkingDirectory; // guest file-I/O root
         QString sProgramName;      // loaded file's base name (DOS: env-block program-path tail)
         quint64 nImageBaseOverride; // map the MAIN image here instead of its preferred base (0 = preferred)
 

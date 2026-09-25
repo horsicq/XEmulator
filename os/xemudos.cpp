@@ -25,10 +25,13 @@
 #include "xemucom.h"
 #include "xemubiosint.h"
 #include "xemumsdosint.h"
+#include "xemudpmi.h"
+#include "xemux86.h"
 #include "dos_lowmem.inc"   // g_dosLowMem: DOSBox IVT + BIOS data area snapshot
 
 XEmuDOS::XEmuDOS(XEmuMemoryManager *pMemoryManager, XEmuArch *pArch, QObject *pParent)
     : XEmuOperatingSystem(pMemoryManager, pArch, pParent), m_pBiosInt(new XEmuBiosInt(pMemoryManager)), m_pMsdosInt(new XEmuMsdosInt(pMemoryManager)),
+      m_pDpmiHost(new XEmuDpmi(pMemoryManager, dynamic_cast<XEmuX86 *>(pArch), m_pMsdosInt)),
       m_nCurRow(0), m_nCurCol(0)
 {
     // Route both service objects' console output through this personality's line buffer,
@@ -40,6 +43,7 @@ XEmuDOS::XEmuDOS(XEmuMemoryManager *pMemoryManager, XEmuArch *pArch, QObject *pP
 
 XEmuDOS::~XEmuDOS()
 {
+    delete m_pDpmiHost;
     delete m_pBiosInt;
     delete m_pMsdosInt;
 }
@@ -278,6 +282,8 @@ void XEmuDOS::_populateLowMem()
     m_pMemoryManager->writeByte(0xF14A1, 0x21);
     m_pMemoryManager->writeByte(0xF14A2, 0xCF);
 
+    m_pDpmiHost->installSwitchStub();
+
     // Remember the vector table as booted, so _dispatchGuestInterrupt can tell "the guest hooked this"
     // from "still the default" without guessing address ranges.
     for (int v = 0; v < 256; v++) {
@@ -344,6 +350,9 @@ void XEmuDOS::_screenPutChar(char c)
 
 bool XEmuDOS::timerTick(XEmuRegisters *pRegisters)
 {
+    if (m_pDpmiHost->isActive()) {
+        return false;  // real-mode IVT frames are not protected-mode interrupt frames
+    }
     // IRQ0 only fires with interrupts enabled, and injecting it is pointless unless the guest
     // installed its own handler -- the BIOS default merely counts the tick, which the harness
     // already maintains at 0040:006C. EXELOCK 666 hooks the timer and spins until its handler runs.
@@ -371,7 +380,7 @@ bool XEmuDOS::handleInterrupt(int nVector, XEmuRegisters *pRegisters)
             // Guard against recursion: a hook that itself issues `int 21h` (rather than chaining with a
             // far JMP) would otherwise be dispatched into itself forever. While a dispatched hook is on
             // the stack, service DOS natively.
-            if (!m_bInInt21Hook && (pRegisters->nCS != 0xF000) && _dispatchGuestInterrupt(0x21, pRegisters)) {
+            if (!m_pDpmiHost->isActive() && !m_bInInt21Hook && (pRegisters->nCS != 0xF000) && _dispatchGuestInterrupt(0x21, pRegisters)) {
                 m_bInInt21Hook = true;
                 return true;
             }
@@ -416,6 +425,9 @@ bool XEmuDOS::handleInterrupt(int nVector, XEmuRegisters *pRegisters)
 
         case 0x2F: {  // DOS multiplex interrupt
             quint16 nAx = (quint16)pRegisters->getGPR(XEmuRegisters::GPR_RAX, 2);
+            if (nAx == 0x1687) {
+                return m_pDpmiHost->detect(pRegisters);
+            }
             if ((nAx & 0xFF00) == 0x4300) {
                 // XMS installation check: report NOT installed (AL != 0x80) so packers fall back to
                 // conventional memory. The compressed output is the same wherever the buffers live.
@@ -423,6 +435,12 @@ bool XEmuDOS::handleInterrupt(int nVector, XEmuRegisters *pRegisters)
             }
             return true;  // other multiplex calls: benign no-op
         }
+
+        case XEmuDpmi::N_SWITCH_VECTOR:
+            return m_pDpmiHost->switchFromRealMode(pRegisters);
+
+        case 0x31:
+            return m_pDpmiHost->interrupt31(pRegisters);
 
         case 0x67:  // EMS / VCPI. Report NOT present: AH=DE00 (VCPI check) returns AH != 0 -> absent,
                     // so packers fall back to conventional memory (same compressed output).
@@ -459,7 +477,7 @@ bool XEmuDOS::handleInterrupt(int nVector, XEmuRegisters *pRegisters)
             if (m_pBiosInt->handle(nVector, pRegisters)) {  // BIOS video / keyboard
                 return true;
             }
-            if (_dispatchGuestInterrupt(nVector, pRegisters)) {  // program's own INT handler in RAM
+            if (!m_pDpmiHost->isActive() && _dispatchGuestInterrupt(nVector, pRegisters)) {  // program's own INT handler in RAM
                 return true;
             }
             // A software INT to a vector nothing models: on a real DOS machine every IVT entry points
@@ -605,6 +623,7 @@ bool XEmuDOS::setupProcess(XEmuFileFormat *pMainFormat, XEmuRegisters *pRegister
     m_pMemoryManager->clear();
     m_pMemoryManager->setBits(32);  // flat linear backing store
     m_pArch->setBits(16);           // 16-bit real mode
+    m_pDpmiHost->reset(0);
 
     // --- COM: flat image loaded at offset 0x100 in the program's segment ---
     if (pMainFormat->isDosCom()) {
@@ -659,6 +678,7 @@ bool XEmuDOS::setupProcess(XEmuFileFormat *pMainFormat, XEmuRegisters *pRegister
         _populatePspFcbs(nSegBase, options.sCommandLine);
         const quint16 nComEnvSeg = _setupEnvironment(nSegBase, options.sProgramName);  // env block -> PSP:2Ch
         m_pMsdosInt->setPspSegment((quint16)(nSegBase >> 4));  // PSP segment for AH=55/62 tracking
+        m_pDpmiHost->setPspSegment((quint16)(nSegBase >> 4));
         // A .COM owns all of conventional memory from its PSP to the top. The EXE loader has always
         // built an MCB chain; the COM path never did, so m_nFirstMcb stayed 0 and anything that walks
         // the chain (AH=52h, "how much memory is free", TSR enumeration) had nothing to walk.
@@ -788,6 +808,7 @@ bool XEmuDOS::setupProcess(XEmuFileFormat *pMainFormat, XEmuRegisters *pRegister
     _populatePspFcbs(nPspLinear, options.sCommandLine);
     quint16 nEnvSeg = _setupEnvironment(nPspLinear, options.sProgramName);  // env block -> PSP:2Ch
     m_pMsdosInt->setPspSegment(nPspSeg);  // PSP segment for AH=55/62 tracking
+    m_pDpmiHost->setPspSegment(nPspSeg);
     m_nPspSeg = nPspSeg;                 // lower bound for dispatching INTs to guest handlers
     // MCB chain: env block (0x49 paras) then the program block owning to the memory top. A maxalloc==0
     // load-high program owns everything and shrinks/splits it via AH=4A to make room for its children;

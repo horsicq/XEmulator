@@ -40,8 +40,8 @@ public:
         QString sSystemRoot;
         quint64 nStackSize;
         bool bLoadDependencies;
-        QString sCommandLine;       // program arguments (DOS: PSP command tail)
-        QString sWorkingDirectory;  // DOS current directory: base for INT 21h file I/O paths
+        QString sCommandLine;       // guest arguments (DOS PSP tail / Windows GetCommandLine)
+        QString sWorkingDirectory;  // guest file-I/O root
         quint64 nImageBaseOverride;  // map the MAIN image here instead of its preferred base (0 = preferred); relocation-reconstruction uses this to run the stub at a second base
 
         OPTIONS() : nStackSize(0x100000), bLoadDependencies(true), nImageBaseOverride(0)

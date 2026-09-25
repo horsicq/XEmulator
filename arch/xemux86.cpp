@@ -26,6 +26,64 @@
 namespace {
 const char *const g_pszAluNames[8] = {"add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"};
 
+void multiplyUnsigned64(quint64 a, quint64 b, quint64 *lo, quint64 *hi)
+{
+    const quint64 a0 = static_cast<quint32>(a), a1 = a >> 32;
+    const quint64 b0 = static_cast<quint32>(b), b1 = b >> 32;
+    const quint64 p00 = a0 * b0, p01 = a0 * b1;
+    const quint64 p10 = a1 * b0, p11 = a1 * b1;
+    const quint64 middle = (p00 >> 32) + static_cast<quint32>(p01) + static_cast<quint32>(p10);
+    *lo = (middle << 32) | static_cast<quint32>(p00);
+    *hi = p11 + (p01 >> 32) + (p10 >> 32) + (middle >> 32);
+}
+
+void multiplySigned64(quint64 a, quint64 b, quint64 *lo, quint64 *hi)
+{
+    multiplyUnsigned64(a, b, lo, hi);
+    if (a >> 63) *hi -= b;
+    if (b >> 63) *hi -= a;
+}
+
+bool divideUnsigned128(quint64 hi, quint64 lo, quint64 divisor, quint64 *quotient, quint64 *remainder)
+{
+    if (!divisor || hi >= divisor) return false;
+    if (!hi) {
+        *quotient = lo / divisor;
+        *remainder = lo % divisor;
+        return true;
+    }
+    quint64 q = 0, r = hi;
+    for (int bit = 63; bit >= 0; --bit) {
+        const bool carry = (r >> 63) != 0;
+        r = (r << 1) | ((lo >> bit) & 1);
+        if (carry || r >= divisor) {
+            r -= divisor;
+            q |= quint64(1) << bit;
+        }
+    }
+    *quotient = q;
+    *remainder = r;
+    return true;
+}
+
+bool divideSigned128(quint64 hi, quint64 lo, quint64 divisor, quint64 *quotient, quint64 *remainder)
+{
+    const bool negativeNumerator = (hi >> 63) != 0;
+    const bool negativeDivisor = (divisor >> 63) != 0;
+    if (negativeNumerator) {
+        lo = ~lo + 1;
+        hi = ~hi + (lo == 0);
+    }
+    if (negativeDivisor) divisor = ~divisor + 1;
+    quint64 q = 0, r = 0;
+    if (!divideUnsigned128(hi, lo, divisor, &q, &r)) return false;
+    const bool negativeQuotient = negativeNumerator != negativeDivisor;
+    if (q > (negativeQuotient ? (quint64(1) << 63) : ((quint64(1) << 63) - 1))) return false;
+    *quotient = negativeQuotient ? ~q + 1 : q;
+    *remainder = negativeNumerator ? ~r + 1 : r;
+    return true;
+}
+
 double readF80Value(XEmuMemoryManager *pMemoryManager, XADDR nAddress)
 {
     quint64 nMantissa = 0;
@@ -339,6 +397,42 @@ void XEmuX86::setBits(quint8 nBits)
 {
     m_nBits = nBits;
     m_tbCache.clear();  // cached translations are mode-specific
+}
+
+void XEmuX86::setProtectedMode(bool enabled)
+{
+    if (m_bProtectedMode != enabled) {
+        m_bProtectedMode = enabled;
+        resetCache();
+    }
+}
+
+void XEmuX86::setSelectorDescriptor(quint16 selector, XADDR base, quint32 limit, bool default32)
+{
+    SelectorDescriptor descriptor;
+    descriptor.base = base;
+    descriptor.limit = limit;
+    descriptor.default32 = default32;
+    m_selectors.insert(selector, descriptor);
+    resetCache();
+}
+
+XADDR XEmuX86::selectorBase(quint16 selector) const
+{
+    if (m_bProtectedMode || m_nBits == 32) {
+        auto it = m_selectors.constFind(selector);
+        return it == m_selectors.cend() ? 0 : it->base;
+    }
+    return m_nBits == 16 ? ((XADDR)selector << 4) : 0;
+}
+
+bool XEmuX86::selectorDefault32(quint16 selector) const
+{
+    if (m_bProtectedMode) {
+        auto it = m_selectors.constFind(selector);
+        return it != m_selectors.cend() && it->default32;
+    }
+    return m_nBits == 32;
 }
 
 int XEmuX86::getBlockCacheCount() const
@@ -749,6 +843,15 @@ void XEmuX86::_decodeTwoByte(DEC &dec, XEmuMicroOp &op)
         op.nSrcSize = 0;  // two-operand form (no immediate)
         op.nSize = dec.nOpSize;
         op.sText = QStringLiteral("imul");
+    } else if ((nOpcode == 0xB0) || (nOpcode == 0xB1)) {
+        int nRegField = 0;
+        XEmuOperand rm;
+        _decodeModRM(dec, nRegField, rm);
+        op.kind = MOP_CMPXCHG;
+        op.dst = rm;
+        op.src = XEmuOperand::reg(nRegField);
+        op.nSize = (nOpcode == 0xB0) ? 1 : dec.nOpSize;
+        op.sText = QStringLiteral("cmpxchg");
     } else if ((nOpcode == 0xC0) || (nOpcode == 0xC1)) {
         // XADD r/m, reg. dst = r/m (destination), src = reg. 0xC0 is the byte form.
         int nRegField = 0;
@@ -776,6 +879,8 @@ void XEmuX86::_decodeTwoByte(DEC &dec, XEmuMicroOp &op)
         op.dst = XEmuOperand::reg((nOpcode - 0xC8) + (dec.bRexB ? 8 : 0));
         op.nSize = dec.nOpSize;
         op.sText = QStringLiteral("bswap");
+    } else if (_decodeSSE(dec, op, nOpcode)) {
+        // XMM instruction.
     } else if (_decodeMMX(dec, op, nOpcode)) {
         // MMX packed-integer instruction (handled).
     } else if ((nOpcode == 0xA4) || (nOpcode == 0xA5) || (nOpcode == 0xAC) || (nOpcode == 0xAD)) {
@@ -856,6 +961,14 @@ enum MMXOP {
     MMX_MOVD_TO, MMX_MOVD_FROM, MMX_MOVQ_TO, MMX_MOVQ_FROM
 };
 
+enum SSEOP {
+    SSE_MOV128_LOAD, SSE_MOV128_STORE, SSE_MOV_SCALAR_LOAD, SSE_MOV_SCALAR_STORE,
+    SSE_PXOR, SSE_PCMPEQD, SSE_AND, SSE_PUNPCKLQDQ,
+    SSE_UCOMI, SSE_ADD, SSE_MUL, SSE_DIV, SSE_CVTSI2FP, SSE_CVTTFP2SI,
+    SSE_MOV_GPR_TO_XMM, SSE_MOV_XMM_TO_GPR, SSE_MOVQ_LOAD, SSE_MOVQ_STORE,
+    SSE_MOVHPS_LOAD, SSE_MOVHPS_STORE
+};
+
 inline bool mmxIsShift(int nOp) { return (nOp >= MMX_PSLLW) && (nOp <= MMX_PSRAD); }
 
 inline quint8 msatU8(qint32 v) { return (quint8)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
@@ -868,6 +981,128 @@ inline quint16 gW(quint64 v, int i) { return (quint16)(v >> (i * 16)); }
 inline quint32 gD(quint64 v, int i) { return (quint32)(v >> (i * 32)); }
 
 }  // namespace
+
+bool XEmuX86::_decodeSSE(DEC &dec, XEmuMicroOp &op, quint8 opcode)
+{
+    const bool p66 = dec.bOpSize16;
+    const int rep = dec.nRep;
+    int operation = -1;
+    int width = 16;
+    QString mnemonic;
+    switch (opcode) {
+        case 0x10:
+        case 0x11:
+            operation = opcode == 0x10 ? SSE_MOV128_LOAD : SSE_MOV128_STORE;
+            if (rep != 0) {
+                operation = opcode == 0x10 ? SSE_MOV_SCALAR_LOAD : SSE_MOV_SCALAR_STORE;
+                width = rep == 1 ? 4 : 8;
+                mnemonic = rep == 1 ? QStringLiteral("movss") : QStringLiteral("movsd");
+            } else {
+                mnemonic = p66 ? QStringLiteral("movupd") : QStringLiteral("movups");
+            }
+            break;
+        case 0x28:
+        case 0x29:
+            if (rep != 0) return false;
+            operation = opcode == 0x28 ? SSE_MOV128_LOAD : SSE_MOV128_STORE;
+            mnemonic = p66 ? QStringLiteral("movapd") : QStringLiteral("movaps");
+            break;
+        case 0x6F:
+        case 0x7F:
+            if (!p66 && rep != 1) return false;
+            operation = opcode == 0x6F ? SSE_MOV128_LOAD : SSE_MOV128_STORE;
+            mnemonic = p66 ? QStringLiteral("movdqa") : QStringLiteral("movdqu");
+            break;
+        case 0x6E:
+            if (!p66 || rep != 0) return false;
+            operation = SSE_MOV_GPR_TO_XMM;
+            width = dec.bRexW ? 8 : 4;
+            mnemonic = dec.bRexW ? QStringLiteral("movq") : QStringLiteral("movd");
+            break;
+        case 0x7E:
+            if (p66 && rep == 0) {
+                operation = SSE_MOV_XMM_TO_GPR;
+                width = dec.bRexW ? 8 : 4;
+            } else if (rep == 1 && !p66) {
+                operation = SSE_MOVQ_LOAD;
+                width = 8;
+            } else return false;
+            mnemonic = width == 8 ? QStringLiteral("movq") : QStringLiteral("movd");
+            break;
+        case 0xD6:
+            if (!p66 || rep != 0) return false;
+            operation = SSE_MOVQ_STORE; width = 8; mnemonic = QStringLiteral("movq"); break;
+        case 0x16:
+        case 0x17:
+            if (rep != 0 || p66) return false;
+            operation = opcode == 0x16 ? SSE_MOVHPS_LOAD : SSE_MOVHPS_STORE;
+            width = 8; mnemonic = QStringLiteral("movhps"); break;
+        case 0xEF:
+            if (!p66 || rep != 0) return false;
+            operation = SSE_PXOR; mnemonic = QStringLiteral("pxor"); break;
+        case 0x76:
+            if (!p66 || rep != 0) return false;
+            operation = SSE_PCMPEQD; mnemonic = QStringLiteral("pcmpeqd"); break;
+        case 0x54:
+            if (rep != 0) return false;
+            operation = SSE_AND; mnemonic = p66 ? QStringLiteral("andpd") : QStringLiteral("andps"); break;
+        case 0x6C:
+            if (!p66 || rep != 0) return false;
+            operation = SSE_PUNPCKLQDQ; mnemonic = QStringLiteral("punpcklqdq"); break;
+        case 0x2E:
+        case 0x2F:
+            if (rep != 0) return false;
+            operation = SSE_UCOMI; width = p66 ? 8 : 4;
+            mnemonic = p66 ? QStringLiteral("ucomisd") : QStringLiteral("ucomiss"); break;
+        case 0x58:
+        case 0x59:
+        case 0x5E:
+            if (rep == 0) return false;
+            operation = opcode == 0x58 ? SSE_ADD : opcode == 0x59 ? SSE_MUL : SSE_DIV;
+            width = rep == 1 ? 4 : 8;
+            mnemonic = opcode == 0x58 ? (rep == 1 ? QStringLiteral("addss") : QStringLiteral("addsd"))
+                       : opcode == 0x59 ? (rep == 1 ? QStringLiteral("mulss") : QStringLiteral("mulsd"))
+                                       : (rep == 1 ? QStringLiteral("divss") : QStringLiteral("divsd"));
+            break;
+        case 0x2A:
+            if (rep == 0) return false;
+            operation = SSE_CVTSI2FP; width = rep == 1 ? 4 : 8;
+            mnemonic = rep == 1 ? QStringLiteral("cvtsi2ss") : QStringLiteral("cvtsi2sd"); break;
+        case 0x2C:
+            if (rep == 0) return false;
+            operation = SSE_CVTTFP2SI; width = rep == 1 ? 4 : 8;
+            mnemonic = rep == 1 ? QStringLiteral("cvttss2si") : QStringLiteral("cvttsd2si"); break;
+        default: return false;
+    }
+
+    int reg = 0;
+    XEmuOperand rm;
+    _decodeModRM(dec, reg, rm);
+    if ((operation == SSE_MOVHPS_LOAD || operation == SSE_MOVHPS_STORE) && rm.bIsReg) return false;
+    const XEmuOperand xmmReg = XEmuOperand::xmm(reg);
+    const XEmuOperand xmmRm = rm.bIsReg ? XEmuOperand::xmm(rm.nReg) : rm;
+    op.kind = MOP_SSE;
+    op.nAluOp = operation;
+    op.nSize = width;
+    op.nSrcSize = dec.bRexW ? 8 : 4;
+    op.sText = mnemonic;
+    if (operation == SSE_CVTSI2FP || operation == SSE_MOV_GPR_TO_XMM) {
+        op.dst = xmmReg;
+        op.src = rm;
+    } else if (operation == SSE_CVTTFP2SI || operation == SSE_MOV_XMM_TO_GPR) {
+        op.dst = XEmuOperand::reg(reg);
+        op.src = operation == SSE_CVTTFP2SI ? xmmRm : xmmReg;
+        if (operation == SSE_MOV_XMM_TO_GPR) op.dst = rm;
+    } else if (operation == SSE_MOV128_STORE || operation == SSE_MOV_SCALAR_STORE ||
+               operation == SSE_MOVQ_STORE || operation == SSE_MOVHPS_STORE) {
+        op.dst = xmmRm;
+        op.src = xmmReg;
+    } else {
+        op.dst = xmmReg;
+        op.src = xmmRm;
+    }
+    return true;
+}
 
 bool XEmuX86::_decodeMMX(DEC &dec, XEmuMicroOp &op, quint8 nOpcode)
 {
@@ -1865,6 +2100,7 @@ bool XEmuX86::_decodeInsn(XADDR nAddress, XEmuMicroOp &op)
         }
     }
 
+    op.nAddrSize = dec.nAddrSize;
     op.nLength = (quint32)(dec.nFetch - dec.nStart);
     return true;
 }
@@ -1907,7 +2143,7 @@ XEmuTB *XEmuX86::_translateBlock(XADDR nAddress)
 XADDR XEmuX86::_resolveAddr(const XEmuMicroOp &op, const XEmuOperand &opnd, bool bOffsetOnly)
 {
     XADDR nAddress;
-    int nAddrSize = (m_nBits == 64) ? 8 : 4;
+    const int nAddrSize = op.nAddrSize;
 
     if (opnd.bRipRel) {
         nAddress = op.nAddress + op.nLength + opnd.nDisp;
@@ -1920,7 +2156,9 @@ XADDR XEmuX86::_resolveAddr(const XEmuMicroOp &op, const XEmuOperand &opnd, bool
             nValue += (qint64)m_pExecRegs->getGPR(opnd.nIndexReg, nAddrSize) * opnd.nScale;
         }
         nAddress = (quint64)nValue;
-        if (nAddrSize == 4) {
+        if (nAddrSize == 2) {
+            nAddress &= 0xFFFF;
+        } else if (nAddrSize == 4) {
             nAddress &= 0xFFFFFFFF;
         }
     }
@@ -1930,18 +2168,14 @@ XADDR XEmuX86::_resolveAddr(const XEmuMicroOp &op, const XEmuOperand &opnd, bool
     // at 0xFFFF. This is invisible in a .COM (segment<<4 is a multiple of 0x10000, low word 0)
     // but corrupts every .EXE whose segment isn't 0x1000-aligned.
     if (bOffsetOnly) {
-        return (m_nBits == 16) ? (nAddress & 0xFFFF) : nAddress;
+        return nAddress;
     }
 
     if (opnd.nSegSource == 1) {
-        nAddress += m_pExecRegs->nFSBase;
+        nAddress += m_bProtectedMode ? selectorBase(m_pExecRegs->nFS) : m_pExecRegs->nFSBase;
     } else if (opnd.nSegSource == 2) {
-        nAddress += m_pExecRegs->nGSBase;
-    } else if (m_nBits == 16) {
-        // Real mode: the effective offset is 16-bit and wraps within the 64 KiB segment
-        // (base/index registers are read wide, so mask before forming the linear address);
-        // linear = (segment << 4) + (offset & 0xFFFF). The segment is the override when one
-        // is present, else SS for BP/SP-based addressing and DS for everything else.
+        nAddress += m_bProtectedMode ? selectorBase(m_pExecRegs->nGS) : m_pExecRegs->nGSBase;
+    } else if (m_nBits == 16 || m_bProtectedMode) {
         quint16 nSeg;
         switch (opnd.nSegSource) {
             case 3: nSeg = m_pExecRegs->nES; break;
@@ -1952,7 +2186,7 @@ XADDR XEmuX86::_resolveAddr(const XEmuMicroOp &op, const XEmuOperand &opnd, bool
                 nSeg = ((opnd.nBaseReg == XEmuRegisters::GPR_RBP) || (opnd.nBaseReg == XEmuRegisters::GPR_RSP)) ? m_pExecRegs->nSS : m_pExecRegs->nDS;
                 break;
         }
-        nAddress = (nAddress & 0xFFFF) + (((quint64)nSeg) << 4);
+        nAddress += selectorBase(nSeg);
     }
 
     // Real mode addresses wrap at 1 MiB (no A20 gate): FFFF:0010 aliases 0000:0000. Wrapping here
@@ -2022,15 +2256,17 @@ void XEmuX86::_writeOpnd(const XEmuMicroOp &op, const XEmuOperand &opnd, int nSi
 
 void XEmuX86::_push(quint64 nValue, int nSize)
 {
-    int nSpSize = (m_nBits == 64) ? 8 : ((m_nBits == 16) ? 2 : 4);
+    int nSpSize = (m_nBits == 64) ? 8
+                  : m_bProtectedMode ? (selectorDefault32(m_pExecRegs->nSS) ? 4 : 2)
+                                     : ((m_nBits == 16) ? 2 : 4);
     m_pExecRegs->setGPR(XEmuRegisters::GPR_RSP, nSpSize, m_pExecRegs->getGPR(XEmuRegisters::GPR_RSP, nSpSize) - nSize);
 
     // Re-read the stack pointer masked to its width -- when SP wraps (a push with SP <
     // nSize) the raw subtraction underflows to a huge value; the real-mode segment add must
     // use the wrapped 16-bit SP so the write lands at SS:SP inside the stack segment.
     quint64 nSp = m_pExecRegs->getGPR(XEmuRegisters::GPR_RSP, nSpSize);
-    if (m_nBits == 16) {
-        nSp += ((quint64)m_pExecRegs->nSS) << 4;  // (SS << 4) + SP
+    if (m_nBits == 16 || m_bProtectedMode) {
+        nSp += selectorBase(m_pExecRegs->nSS);
     }
 
     bool bOk = false;
@@ -2049,12 +2285,14 @@ void XEmuX86::_push(quint64 nValue, int nSize)
 
 quint64 XEmuX86::_pop(int nSize)
 {
-    int nSpSize = (m_nBits == 64) ? 8 : ((m_nBits == 16) ? 2 : 4);
+    int nSpSize = (m_nBits == 64) ? 8
+                  : m_bProtectedMode ? (selectorDefault32(m_pExecRegs->nSS) ? 4 : 2)
+                                     : ((m_nBits == 16) ? 2 : 4);
     quint64 nSpOffset = m_pExecRegs->getGPR(XEmuRegisters::GPR_RSP, nSpSize);
 
     quint64 nSp = nSpOffset;
-    if (m_nBits == 16) {
-        nSp += ((quint64)m_pExecRegs->nSS) << 4;
+    if (m_nBits == 16 || m_bProtectedMode) {
+        nSp += selectorBase(m_pExecRegs->nSS);
     }
 
     bool bOk = false;
@@ -2889,7 +3127,14 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
 
     // Real mode keeps a linear PC, but a near ret / indirect near jmp|call recovers only
     // the 16-bit IP (offset). Re-form the linear address as (CS << 4) + IP for those.
-    const quint64 nCodeSegBase = (m_nBits == 16) ? ((quint64)pRegisters->nCS << 4) : 0;
+    const quint64 nCodeSegBase = (m_nBits == 16 || m_bProtectedMode) ? selectorBase(pRegisters->nCS) : 0;
+    auto setFarPC = [&](quint16 selector, quint64 offset) {
+        pRegisters->nCS = selector;
+        pRegisters->nRIP = selectorBase(selector) + offset;
+        if (m_bProtectedMode) {
+            setBits(selectorDefault32(selector) ? 32 : 16);
+        }
+    };
 
     // In 16-bit real mode a near relative branch wraps within the 64 KiB code segment: the
     // target offset is taken modulo 0x10000 before the segment base is re-applied, so a large
@@ -2991,31 +3236,29 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
             // back to (CS << 4). Pushing the full linear address only matches when the segment
             // base is a multiple of 64 KiB (CS a multiple of 0x1000) -- broken once code runs at
             // a relocated segment like 0x13E7, so push the segment-relative offset in 16-bit mode.
-            _push((m_nBits == 16) ? (nFall - nCodeSegBase) : nFall, nPtrSize);
+            _push((m_nBits == 16 || m_bProtectedMode) ? (nFall - nCodeSegBase) : nFall, nPtrSize);
             pRegisters->nRIP = wrapNearBranch(m_nBits, nCodeSegBase, op.nBranchTarget);
             bBranch = true;
             break;
         case MOP_CALL_IND: {
             quint64 nTarget = wrapNearBranch(m_nBits, nCodeSegBase, nCodeSegBase + _readOpnd(op, op.src, op.nSize));
-            _push((m_nBits == 16) ? (nFall - nCodeSegBase) : nFall, nPtrSize);
+            _push((m_nBits == 16 || m_bProtectedMode) ? (nFall - nCodeSegBase) : nFall, nPtrSize);
             pRegisters->nRIP = nTarget;
             bBranch = true;
             break;
         }
         case MOP_JMP_FAR: {
             quint16 nNewCS = (quint16)op.nImm;
-            pRegisters->nCS = nNewCS;
-            pRegisters->nRIP = ((quint64)nNewCS << 4) + (op.nBranchTarget & 0xFFFF);
+            setFarPC(nNewCS, m_bProtectedMode ? op.nBranchTarget : (op.nBranchTarget & 0xFFFF));
             bBranch = true;
             break;
         }
         case MOP_CALL_FAR: {
             quint16 nNewCS = (quint16)op.nImm;
-            quint16 nRetIP = (quint16)((nFall - nCodeSegBase) & 0xFFFF);
-            _push(pRegisters->nCS, 2);  // far return address: CS then IP (popped IP first by RETF)
-            _push(nRetIP, 2);
-            pRegisters->nCS = nNewCS;
-            pRegisters->nRIP = ((quint64)nNewCS << 4) + (op.nBranchTarget & 0xFFFF);
+            const int nFarSize = m_bProtectedMode ? nPtrSize : 2;
+            _push(pRegisters->nCS, nFarSize);
+            _push(nFall - nCodeSegBase, nFarSize);
+            setFarPC(nNewCS, m_bProtectedMode ? op.nBranchTarget : (op.nBranchTarget & 0xFFFF));
             bBranch = true;
             break;
         }
@@ -3023,7 +3266,8 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
         case MOP_CALL_FAR_IND: {
             XADDR nPtr = _resolveAddr(op, op.src);
             bool bOk1 = false, bOk2 = false;
-            quint16 nNewIP = m_pMemoryManager->readWord(nPtr, &bOk1);
+            quint64 nNewIP = _memReadSized(nPtr, op.nSize);
+            bOk1 = !m_bExecFault;
             quint16 nNewCS = m_pMemoryManager->readWord(nPtr + op.nSize, &bOk2);
             if (!bOk1 || !bOk2) {
                 m_bExecFault = true;
@@ -3031,12 +3275,11 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                 break;
             }
             if (op.kind == MOP_CALL_FAR_IND) {
-                quint16 nRetIP = (quint16)((nFall - nCodeSegBase) & 0xFFFF);
-                _push(pRegisters->nCS, 2);
-                _push(nRetIP, 2);
+                const int nFarSize = m_bProtectedMode ? op.nSize : 2;
+                _push(pRegisters->nCS, nFarSize);
+                _push(nFall - nCodeSegBase, nFarSize);
             }
-            pRegisters->nCS = nNewCS;
-            pRegisters->nRIP = ((quint64)nNewCS << 4) + nNewIP;
+            setFarPC(nNewCS, nNewIP);
             bBranch = true;
             break;
         }
@@ -3057,20 +3300,19 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                 m_bSsBlock = true;  // LSS: an SS load inhibits the trap for one instruction
             } else if (op.nCond == 3) {
                 pRegisters->nFS = nSeg;
-                pRegisters->nFSBase = (quint64)nSeg << 4;
+                pRegisters->nFSBase = selectorBase(nSeg);
             } else {
                 pRegisters->nGS = nSeg;
-                pRegisters->nGSBase = (quint64)nSeg << 4;
+                pRegisters->nGSBase = selectorBase(nSeg);
             }
             break;
         }
         case MOP_RETF: {
-            if (m_nBits == 16) {
+            if (!m_bProtectedMode && m_nBits == 16) {
                 // Real-mode far return: pop 2-byte IP then 2-byte CS; target = CS*16 + IP.
                 quint16 nNewIP = (quint16)_pop(2);
                 quint16 nNewCS = (quint16)_pop(2);
-                pRegisters->nCS = nNewCS;
-                pRegisters->nRIP = ((quint64)nNewCS << 4) + nNewIP;
+                setFarPC(nNewCS, nNewIP);
             } else {
                 // Protected-mode far return: pop the operand-size-wide EIP/RIP then the
                 // zero-extended CS selector. CS base is 0 in the flat user model, so the
@@ -3082,24 +3324,23 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                 const int nOp = (op.nSize > 0) ? op.nSize : nPtrSize;
                 quint64 nNewIP = _pop(nOp);
                 quint64 nNewCS = _pop(nOp);
-                pRegisters->nCS = (quint16)nNewCS;
-                pRegisters->nRIP = nCodeSegBase + nNewIP;
+                setFarPC((quint16)nNewCS, nNewIP);
             }
             if (op.nImm) {
-                int nSpSize = (m_nBits == 16) ? 2 : 4;
+                int nSpSize = m_bProtectedMode ? (selectorDefault32(pRegisters->nSS) ? 4 : 2)
+                                                : ((m_nBits == 16) ? 2 : 4);
                 pRegisters->setGPR(XEmuRegisters::GPR_RSP, nSpSize, pRegisters->getGPR(XEmuRegisters::GPR_RSP, nSpSize) + op.nImm);
             }
             bBranch = true;
             break;
         }
         case MOP_IRET: {
-            // Real-mode interrupt return: pop IP, CS, then FLAGS.
-            quint16 nNewIP = (quint16)_pop(2);
-            quint16 nNewCS = (quint16)_pop(2);
-            quint16 nFlags = (quint16)_pop(2);
-            pRegisters->nCS = nNewCS;
-            pRegisters->nRIP = ((quint64)nNewCS << 4) + nNewIP;
-            pRegisters->nRFLAGS = (pRegisters->nRFLAGS & ~0xFFFFull) | nFlags;
+            const int nOpSize = m_bProtectedMode ? nPtrSize : 2;
+            quint64 nNewIP = _pop(nOpSize);
+            quint16 nNewCS = (quint16)_pop(nOpSize);
+            quint64 nFlags = _pop(nOpSize);
+            setFarPC(nNewCS, nNewIP);
+            pRegisters->nRFLAGS = (pRegisters->nRFLAGS & ~_mask(nOpSize)) | (nFlags & _mask(nOpSize));
             pRegisters->nRFLAGS |= 0x2ull;
             pRegisters->nRFLAGS &= ~0x8028ull;  // reserved bits 3, 5, 15 always 0
             bBranch = true;
@@ -3108,7 +3349,9 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
         case MOP_RET: {
             quint64 nTarget = nCodeSegBase + _pop(nPtrSize);
             if (op.nImm) {
-                int nSpSize = (m_nBits == 64) ? 8 : ((m_nBits == 16) ? 2 : 4);
+                int nSpSize = (m_nBits == 64) ? 8
+                              : m_bProtectedMode ? (selectorDefault32(pRegisters->nSS) ? 4 : 2)
+                                                 : ((m_nBits == 16) ? 2 : 4);
                 pRegisters->setGPR(XEmuRegisters::GPR_RSP, nSpSize, pRegisters->getGPR(XEmuRegisters::GPR_RSP, nSpSize) + op.nImm);
             }
             pRegisters->nRIP = nTarget;
@@ -3208,7 +3451,8 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
             for (int i = 1; i < nLevel; i++) {
                 quint64 nBp = pRegisters->getGPR(XEmuRegisters::GPR_RBP, nPtrSize);
                 pRegisters->setGPR(XEmuRegisters::GPR_RBP, nPtrSize, nBp - nPtrSize);
-                _push(_memReadSized((m_nBits == 16 ? ((quint64)pRegisters->nSS << 4) : 0) + ((nBp - nPtrSize) & _mask(nPtrSize)), nPtrSize), nPtrSize);
+                _push(_memReadSized((m_nBits == 16 || m_bProtectedMode ? selectorBase(pRegisters->nSS) : 0)
+                                           + ((nBp - nPtrSize) & _mask(nPtrSize)), nPtrSize), nPtrSize);
             }
             if (nLevel > 0) {
                 _push(nFrame, nPtrSize);
@@ -3326,10 +3570,10 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
             quint64 nOff = (nBx + nAl) & _mask(op.nSize);
             quint64 nSegBase = 0;
             if (op.src.nSegSource == 1) {
-                nSegBase = pRegisters->nFSBase;
+                nSegBase = m_bProtectedMode ? selectorBase(pRegisters->nFS) : pRegisters->nFSBase;
             } else if (op.src.nSegSource == 2) {
-                nSegBase = pRegisters->nGSBase;
-            } else if (m_nBits == 16) {
+                nSegBase = m_bProtectedMode ? selectorBase(pRegisters->nGS) : pRegisters->nGSBase;
+            } else if (m_nBits == 16 || m_bProtectedMode) {
                 quint16 nSeg;
                 switch (op.src.nSegSource) {
                     case 3: nSeg = pRegisters->nES; break;
@@ -3337,7 +3581,7 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                     case 5: nSeg = pRegisters->nSS; break;
                     default: nSeg = pRegisters->nDS; break;  // 0 (none) or 6 (explicit ds) -> DS
                 }
-                nSegBase = ((quint64)nSeg) << 4;
+                nSegBase = selectorBase(nSeg);
             }
             pRegisters->setGPR(XEmuRegisters::GPR_RAX, 1, _memReadSized(nSegBase + nOff, 1));
             break;
@@ -3361,10 +3605,10 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                 m_bSsBlock = true;  // POP SS: ditto -- this is the one ALEC 1.6 counts on
             } else if (op.nAluOp == 4) {
                 pRegisters->nFS = nSeg;
-                pRegisters->nFSBase = (quint64)nSeg << 4;  // real mode: base tracks the selector
+                pRegisters->nFSBase = selectorBase(nSeg);
             } else if (op.nAluOp == 5) {
                 pRegisters->nGS = nSeg;
-                pRegisters->nGSBase = (quint64)nSeg << 4;
+                pRegisters->nGSBase = selectorBase(nSeg);
             } else {
                 pRegisters->nDS = nSeg;
             }
@@ -3468,11 +3712,11 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                 if (op.nAluOp == 2) {
                     m_bSsBlock = true;  // MOV SS,r/m: ditto
                 }
-                // Keep the FS/GS linear bases coherent with the real-mode selector.
+                // Keep the FS/GS cached bases coherent with the selector table.
                 if (op.nAluOp == 4) {
-                    pRegisters->nFSBase = (quint64)nVal << 4;
+                    pRegisters->nFSBase = selectorBase(nVal);
                 } else if (op.nAluOp == 5) {
-                    pRegisters->nGSBase = (quint64)nVal << 4;
+                    pRegisters->nGSBase = selectorBase(nVal);
                 }
             } else {  // mov r/m16, Sreg
                 _writeOpnd(op, op.dst, 2, *pSeg);
@@ -3564,6 +3808,190 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                 pRegisters->setFlag(XEmuRegisters::FLAG_PF, _parity((quint8)v));
                 pRegisters->setFlag(XEmuRegisters::FLAG_AF, true);  // undefined; real x86 sets it
             }
+            break;
+        }
+        case MOP_SSE: {
+            struct XmmValue { quint64 low = 0; quint64 high = 0; };
+            const auto readXmm = [&](const XEmuOperand &operand, int size) {
+                XmmValue value;
+                if (operand.bIsReg) {
+                    value.low = pRegisters->nXMM[operand.nReg & 15][0];
+                    value.high = pRegisters->nXMM[operand.nReg & 15][1];
+                } else {
+                    const XADDR address = _resolveAddr(op, operand);
+                    bool ok = false;
+                    const QByteArray bytes = m_pMemoryManager->read(address, size, &ok);
+                    if (!ok || bytes.size() != size) {
+                        m_bExecFault = true;
+                        m_nFaultAddr = address;
+                    } else {
+                        memcpy(&value.low, bytes.constData(), qMin(size, 8));
+                        if (size == 16) memcpy(&value.high, bytes.constData() + 8, 8);
+                    }
+                }
+                return value;
+            };
+            const auto writeXmm = [&](const XEmuOperand &operand, const XmmValue &value, int size, bool preserveUpper) {
+                if (operand.bIsReg) {
+                    quint64 &low = pRegisters->nXMM[operand.nReg & 15][0];
+                    quint64 &high = pRegisters->nXMM[operand.nReg & 15][1];
+                    if (size == 16) {
+                        low = value.low;
+                        high = value.high;
+                    } else if (size == 8) {
+                        low = value.low;
+                        if (!preserveUpper) high = 0;
+                    } else {
+                        low = preserveUpper ? (low & Q_UINT64_C(0xffffffff00000000)) | (value.low & 0xffffffffu)
+                                            : (value.low & 0xffffffffu);
+                        if (!preserveUpper) high = 0;
+                    }
+                } else {
+                    const XADDR address = _resolveAddr(op, operand);
+                    char bytes[16] = {};
+                    memcpy(bytes, &value.low, qMin(size, 8));
+                    if (size == 16) memcpy(bytes + 8, &value.high, 8);
+                    _noteWrite(address, size);
+                    if (!m_pMemoryManager->write(address, QByteArray(bytes, size))) {
+                        m_bExecFault = true;
+                        m_nFaultAddr = address;
+                    }
+                }
+            };
+            const int kind = op.nAluOp;
+            if (kind == SSE_MOV_GPR_TO_XMM) {
+                const quint64 integer = _readOpnd(op, op.src, op.nSize);
+                if (!m_bExecFault) {
+                    XmmValue value;
+                    value.low = integer;
+                    writeXmm(op.dst, value, op.nSize, false);
+                }
+                break;
+            }
+            if (kind == SSE_MOV_XMM_TO_GPR) {
+                const XmmValue value = readXmm(op.src, op.nSize);
+                if (!m_bExecFault) _writeOpnd(op, op.dst, op.nSize, value.low);
+                break;
+            }
+            if (kind == SSE_MOVQ_LOAD || kind == SSE_MOVQ_STORE) {
+                const XmmValue value = readXmm(op.src, 8);
+                if (!m_bExecFault) writeXmm(op.dst, value, 8, false);
+                break;
+            }
+            if (kind == SSE_MOVHPS_LOAD) {
+                XmmValue value = readXmm(op.dst, 16);
+                const XmmValue source = readXmm(op.src, 8);
+                if (!m_bExecFault) {
+                    value.high = source.low;
+                    writeXmm(op.dst, value, 16, false);
+                }
+                break;
+            }
+            if (kind == SSE_MOVHPS_STORE) {
+                const XmmValue source = readXmm(op.src, 16);
+                XmmValue value;
+                value.low = source.high;
+                if (!m_bExecFault) writeXmm(op.dst, value, 8, false);
+                break;
+            }
+            if (kind == SSE_MOV128_LOAD || kind == SSE_MOV128_STORE ||
+                kind == SSE_MOV_SCALAR_LOAD || kind == SSE_MOV_SCALAR_STORE) {
+                const XmmValue value = readXmm(op.src, op.nSize);
+                if (!m_bExecFault) {
+                    const bool preserve = op.nSize != 16 && op.src.bIsReg;
+                    writeXmm(op.dst, value, op.nSize, preserve);
+                }
+                break;
+            }
+            if (kind == SSE_CVTSI2FP) {
+                const quint64 integer = _readOpnd(op, op.src, op.nSrcSize);
+                if (m_bExecFault) break;
+                const double number = op.nSrcSize == 8 ? (double)(qint64)integer : (double)(qint32)integer;
+                XmmValue value;
+                if (op.nSize == 8) {
+                    const double converted = number;
+                    memcpy(&value.low, &converted, 8);
+                } else {
+                    const float converted = static_cast<float>(number);
+                    memcpy(&value.low, &converted, 4);
+                }
+                writeXmm(op.dst, value, op.nSize, true);
+                break;
+            }
+            const XmmValue source = readXmm(op.src, op.nSize == 16 ? 16 : op.nSize);
+            if (m_bExecFault) break;
+            if (kind == SSE_CVTTFP2SI) {
+                double number = 0;
+                if (op.nSize == 8) memcpy(&number, &source.low, 8);
+                else {
+                    float single = 0;
+                    memcpy(&single, &source.low, 4);
+                    number = single;
+                }
+                const double limit = op.nSrcSize == 8 ? 9223372036854775808.0 : 2147483648.0;
+                const quint64 result = !std::isfinite(number) || number < -limit || number >= limit
+                                           ? (op.nSrcSize == 8 ? Q_UINT64_C(0x8000000000000000) : 0x80000000u)
+                                           : (quint64)(qint64)std::trunc(number);
+                _writeOpnd(op, op.dst, op.nSrcSize, result);
+                break;
+            }
+            const XmmValue destination = readXmm(op.dst, 16);
+            if (m_bExecFault) break;
+            XmmValue result = destination;
+            if (kind == SSE_PXOR) {
+                result.low ^= source.low;
+                result.high ^= source.high;
+            } else if (kind == SSE_AND) {
+                result.low &= source.low;
+                result.high &= source.high;
+            } else if (kind == SSE_PCMPEQD) {
+                for (int i = 0; i < 2; ++i) {
+                    quint64 a = i ? destination.high : destination.low;
+                    quint64 b = i ? source.high : source.low;
+                    quint64 equal = (quint32)a == (quint32)b ? 0xffffffffu : 0;
+                    equal |= ((quint32)(a >> 32) == (quint32)(b >> 32) ? Q_UINT64_C(0xffffffff) : 0) << 32;
+                    if (i) result.high = equal;
+                    else result.low = equal;
+                }
+            } else if (kind == SSE_PUNPCKLQDQ) {
+                result.high = source.low;
+            } else if (kind == SSE_UCOMI) {
+                double a = 0, b = 0;
+                if (op.nSize == 8) {
+                    memcpy(&a, &destination.low, 8);
+                    memcpy(&b, &source.low, 8);
+                } else {
+                    float fa = 0, fb = 0;
+                    memcpy(&fa, &destination.low, 4);
+                    memcpy(&fb, &source.low, 4);
+                    a = fa; b = fb;
+                }
+                const bool unordered = std::isnan(a) || std::isnan(b);
+                pRegisters->setFlag(XEmuRegisters::FLAG_ZF, unordered || a == b);
+                pRegisters->setFlag(XEmuRegisters::FLAG_PF, unordered);
+                pRegisters->setFlag(XEmuRegisters::FLAG_CF, unordered || a < b);
+                pRegisters->setFlag(XEmuRegisters::FLAG_OF, false);
+                pRegisters->setFlag(XEmuRegisters::FLAG_SF, false);
+                pRegisters->setFlag(XEmuRegisters::FLAG_AF, false);
+                break;
+            } else if (kind == SSE_ADD || kind == SSE_MUL || kind == SSE_DIV) {
+                if (op.nSize == 8) {
+                    double a = 0, b = 0;
+                    memcpy(&a, &destination.low, 8);
+                    memcpy(&b, &source.low, 8);
+                    const double value = kind == SSE_ADD ? a + b : kind == SSE_MUL ? a * b : a / b;
+                    memcpy(&result.low, &value, 8);
+                } else {
+                    float a = 0, b = 0;
+                    memcpy(&a, &destination.low, 4);
+                    memcpy(&b, &source.low, 4);
+                    const float value = kind == SSE_ADD ? a + b : kind == SSE_MUL ? a * b : a / b;
+                    quint32 bits = 0;
+                    memcpy(&bits, &value, 4);
+                    result.low = (result.low & Q_UINT64_C(0xffffffff00000000)) | bits;
+                }
+            }
+            writeXmm(op.dst, result, 16, false);
             break;
         }
         case MOP_MMX: {
@@ -3661,6 +4089,20 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
             _writeOpnd(op, op.dst, op.nSize, r);
             break;
         }
+        case MOP_CMPXCHG: {
+            const quint64 oldDst = _readOpnd(op, op.dst, op.nSize);
+            if (m_bExecFault) {
+                break;
+            }
+            const quint64 accumulator = pRegisters->getGPR(XEmuRegisters::GPR_RAX, op.nSize);
+            _setFlagsSub(accumulator, oldDst, accumulator - oldDst, op.nSize);
+            if (accumulator == oldDst) {
+                _writeOpnd(op, op.dst, op.nSize, _readOpnd(op, op.src, op.nSize));
+            } else {
+                pRegisters->setGPR(XEmuRegisters::GPR_RAX, op.nSize, oldDst);
+            }
+            break;
+        }
         case MOP_CDQ: {
             if (op.nAluOp == 0) {  // cbw/cwde/cdqe: sign-extend the accumulator's lower half
                 int nSrc = op.nSize / 2;
@@ -3717,10 +4159,18 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
             // dst = src * sign-extended immediate.
             qint64 a = _signExtend(_readOpnd(op, op.src, op.nSize), op.nSize);
             qint64 b = (op.nSrcSize < 0) ? (qint64)op.nImm : _signExtend(_readOpnd(op, op.dst, op.nSize), op.nSize);
-            qint64 nFull = a * b;
-            quint64 r = (quint64)nFull & _mask(op.nSize);
+            quint64 r = 0;
+            bool bOver = false;
+            if (op.nSize == 8) {
+                quint64 hi = 0;
+                multiplySigned64(static_cast<quint64>(a), static_cast<quint64>(b), &r, &hi);
+                bOver = hi != ((r >> 63) ? ~quint64(0) : quint64(0));
+            } else {
+                const qint64 nFull = a * b;
+                r = static_cast<quint64>(nFull) & _mask(op.nSize);
+                bOver = (_signExtend(r, op.nSize) != nFull);
+            }
             pRegisters->setGPR(op.dst.nReg, op.nSize, r);
-            bool bOver = (_signExtend(r, op.nSize) != nFull);
             pRegisters->setFlag(XEmuRegisters::FLAG_CF, bOver);
             pRegisters->setFlag(XEmuRegisters::FLAG_OF, bOver);
             break;
@@ -3746,15 +4196,19 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                         nLo = nProd & nSzMask;
                         nHi = (nProd >> (op.nSize * 8)) & nSzMask;
                     } else {
-                        nLo = nAcc * (a & nSzMask);
-                        nHi = 0;  // 64-bit high half unsupported (not needed for 32-bit targets)
+                        multiplyUnsigned64(nAcc, a, &nLo, &nHi);
                     }
                     bOver = (nHi != 0);
                 } else {  // signed
-                    qint64 nProd = _signExtend(nAcc, op.nSize) * _signExtend(a, op.nSize);
-                    nLo = (quint64)nProd & nSzMask;
-                    nHi = ((quint64)nProd >> (op.nSize * 8)) & nSzMask;
-                    bOver = (_signExtend(nLo, op.nSize) != nProd);
+                    if (op.nSize == 8) {
+                        multiplySigned64(nAcc, a, &nLo, &nHi);
+                        bOver = nHi != ((nLo >> 63) ? ~quint64(0) : quint64(0));
+                    } else {
+                        const qint64 nProd = _signExtend(nAcc, op.nSize) * _signExtend(a, op.nSize);
+                        nLo = static_cast<quint64>(nProd) & nSzMask;
+                        nHi = (static_cast<quint64>(nProd) >> (op.nSize * 8)) & nSzMask;
+                        bOver = (_signExtend(nLo, op.nSize) != nProd);
+                    }
                 }
                 if (op.nSize == 1) {
                     pRegisters->setGPR(XEmuRegisters::GPR_RAX, 2, ((nHi & 0xFF) << 8) | (nLo & 0xFF));
@@ -3833,10 +4287,18 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                             pRegisters->setGPR(XEmuRegisters::GPR_RAX, op.nSize, (quint64)(nNum / d) & nSzMask);
                             pRegisters->setGPR(XEmuRegisters::GPR_RDX, op.nSize, (quint64)(nNum % d) & nSzMask);
                         }
-                    } else {  // 64-bit: best-effort using rAX only (rare on 32-bit targets)
-                        quint64 d = a & nSzMask;
-                        pRegisters->setGPR(XEmuRegisters::GPR_RAX, 8, nLo / d);
-                        pRegisters->setGPR(XEmuRegisters::GPR_RDX, 8, nLo % d);
+                    } else {
+                        quint64 quotient = 0, remainder = 0;
+                        const bool valid = op.nAluOp == 6
+                            ? divideUnsigned128(nHi, nLo, a, &quotient, &remainder)
+                            : divideSigned128(nHi, nLo, a, &quotient, &remainder);
+                        if (!valid) {
+                            info.result = STEP_FAULT;
+                            info.sComment = QStringLiteral("divide overflow");
+                            return;
+                        }
+                        pRegisters->setGPR(XEmuRegisters::GPR_RAX, 8, quotient);
+                        pRegisters->setGPR(XEmuRegisters::GPR_RDX, 8, remainder);
                     }
                 }
 #if defined(_M_X64) && defined(_WIN32)
@@ -3871,7 +4333,7 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
             // ES/CS/SS/FS/GS -- matters once the segments differ, i.e. in an .EXE), the
             // destination is always ES:DI (not overridable). Flat mode: bases 0 except FS/GS.
             quint64 nSrcSegBase, nDstSegBase;
-            if (m_nBits == 16) {
+            if (m_nBits == 16 || m_bProtectedMode) {
                 quint16 nSrcSeg = m_pExecRegs->nDS;
                 switch (op.src.nSegSource) {
                     case 3: nSrcSeg = m_pExecRegs->nES; break;
@@ -3880,16 +4342,16 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
                     case 6: nSrcSeg = m_pExecRegs->nDS; break;
                     default: break;  // 0 = default DS
                 }
-                nSrcSegBase = ((quint64)nSrcSeg) << 4;
-                nDstSegBase = (quint64)m_pExecRegs->nES << 4;
+                nSrcSegBase = selectorBase(nSrcSeg);
+                nDstSegBase = selectorBase(m_pExecRegs->nES);
             } else {
                 nSrcSegBase = 0;
                 nDstSegBase = 0;
             }
             if (op.src.nSegSource == 1) {
-                nSrcSegBase = m_pExecRegs->nFSBase;
+                nSrcSegBase = m_bProtectedMode ? selectorBase(m_pExecRegs->nFS) : m_pExecRegs->nFSBase;
             } else if (op.src.nSegSource == 2) {
-                nSrcSegBase = m_pExecRegs->nGSBase;
+                nSrcSegBase = m_bProtectedMode ? selectorBase(m_pExecRegs->nGS) : m_pExecRegs->nGSBase;
             }
 
             while (nCount > 0) {
@@ -3999,7 +4461,7 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
             // (DaRKSToP does `mov bp,sp / mov ax,[bp-06] / add ax,0Ch / jmp near ax`). Servicing the
             // interrupt natively without writing them left stale data there and sent it to a wrong
             // address. Write the frame without moving SP: that reproduces the observable side effect.
-            if ((m_nBits == 16) && (op.nAluOp == 2)) {
+            if (!m_bProtectedMode && (m_nBits == 16) && (op.nAluOp == 2)) {
                 const quint64 nSsBase = (quint64)pRegisters->nSS << 4;
                 const quint16 nSp = (quint16)pRegisters->getGPR(XEmuRegisters::GPR_RSP, 2);
                 const quint16 nRetIp = (quint16)((nFall - nCodeSegBase) & 0xFFFF);
@@ -4087,7 +4549,7 @@ void XEmuX86::_execOp(const XEmuMicroOp &op, XEmuRegisters *pRegisters, STEP_INF
     // Steps that faulted or need the OS (syscall/halt) are left alone for the caller to service.
     const bool bSsBlocked = m_bSsBlock;
     m_bSsBlock = false;  // consumed: it covers exactly one trap
-    if (bTfBefore && !bSsBlocked && (info.result == STEP_OK) && (m_nBits == 16)) {
+    if (bTfBefore && !bSsBlocked && (info.result == STEP_OK) && (m_nBits == 16) && !m_bProtectedMode) {
         const quint16 nHOff = m_pMemoryManager->readWord(1 * 4);
         const quint16 nHSeg = m_pMemoryManager->readWord(1 * 4 + 2);
         // Only vector to a real handler in the guest's own memory; the BIOS/DOS default stub is an

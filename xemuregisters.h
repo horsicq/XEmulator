@@ -96,6 +96,7 @@ public:
     quint64 nCR4;
 
     quint64 nMMX[8];  // MMX registers MM0-MM7 (64-bit; aliased to the x87 mantissas on real HW)
+    quint64 nXMM[16][2];  // XMM0-XMM15, low and high 64-bit lanes
 };
 
 #endif  // XEMUREGISTERS_H

@@ -106,6 +106,8 @@ set(XEMULATOR_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/os/xemumacos.h
     ${CMAKE_CURRENT_LIST_DIR}/os/xemudos.cpp
     ${CMAKE_CURRENT_LIST_DIR}/os/xemudos.h
+    ${CMAKE_CURRENT_LIST_DIR}/os/xemudpmi.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/os/xemudpmi.h
 )
 
 endif()

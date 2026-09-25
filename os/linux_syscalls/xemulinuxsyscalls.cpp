@@ -19,6 +19,11 @@
  * SOFTWARE.
  */
 #include "xemulinuxsyscalls.h"
+#include "xemux86.h"
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QSaveFile>
 
 // mmap protection / flag bits (Linux asm-generic values).
 static const quint64 PROT_READ = 0x1;
@@ -88,6 +93,11 @@ void XEmuLinuxSyscalls::setSelfExe(const QByteArray &baBytes, const QString &sPa
     m_sSelfPath = sPath;
 }
 
+void XEmuLinuxSyscalls::setWorkingDirectory(const QString &path)
+{
+    m_sWorkingDirectory = QFileInfo(path).canonicalFilePath();
+}
+
 int XEmuLinuxSyscalls::_newFd()
 {
     return m_nNextFd++;
@@ -125,6 +135,18 @@ void XEmuLinuxSyscalls::_syncMapsToFile(int nFd)
     }
 }
 
+void XEmuLinuxSyscalls::_syncFileToMaps(int fd, quint64 offset, const QByteArray &bytes)
+{
+    const quint64 end = offset + (quint64)bytes.size();
+    for (const SHARED_MAP &map : m_sharedMaps) {
+        if (map.nFd != fd || end <= map.nFileOffset || offset >= map.nFileOffset + map.nLen) continue;
+        const quint64 start = qMax(offset, map.nFileOffset);
+        const quint64 copyEnd = qMin(end, map.nFileOffset + map.nLen);
+        const QByteArray part(bytes.constData() + start - offset, (int)(copyEnd - start));
+        m_pMemoryManager->write(map.nBase + start - map.nFileOffset, part);
+    }
+}
+
 bool XEmuLinuxSyscalls::hasExited() const
 {
     return m_bExited;
@@ -147,6 +169,7 @@ XEmuLinuxSyscalls::SCK_KIND XEmuLinuxSyscalls::_classify(quint64 nNumber) const
             case 158: return SCK_ARCH_PRCTL;
             case 0: return SCK_READ;
             case 1: return SCK_WRITE;
+            case 20: return SCK_WRITEV;
             case 2: return SCK_OPEN;
             case 257: return SCK_OPEN;   // openat
             case 319: return SCK_MEMFD;  // memfd_create
@@ -154,7 +177,10 @@ XEmuLinuxSyscalls::SCK_KIND XEmuLinuxSyscalls::_classify(quint64 nNumber) const
             case 8: return SCK_LSEEK;
             case 18: return SCK_PWRITE;  // pwrite64
             case 5: return SCK_FSTAT;
-            case 262: return SCK_FSTAT;  // newfstatat
+            case 4: return SCK_STAT;
+            case 6: return SCK_STAT;     // lstat
+            case 262: return SCK_STAT;   // newfstatat
+            case 332: return SCK_STATX;
             case 3: return SCK_CLOSE;
             case 32: return SCK_DUP;
             case 33: return SCK_DUP;  // dup2
@@ -190,14 +216,19 @@ XEmuLinuxSyscalls::SCK_KIND XEmuLinuxSyscalls::_classify(quint64 nNumber) const
         case 243: return SCK_SET_THREAD_AREA;
         case 3: return SCK_READ;
         case 4: return SCK_WRITE;
+        case 146: return SCK_WRITEV;
         case 5: return SCK_OPEN;
         case 295: return SCK_OPEN;   // openat
         case 356: return SCK_MEMFD;  // memfd_create
         case 93: return SCK_FTRUNCATE;
         case 194: return SCK_FTRUNCATE;  // ftruncate64
         case 19: return SCK_LSEEK;
+        case 140: return SCK_LSEEK64;  // _llseek
         case 181: return SCK_PWRITE;  // pwrite64
         case 197: return SCK_FSTAT;   // fstat64
+        case 195: return SCK_STAT;    // stat64
+        case 196: return SCK_STAT;    // lstat64
+        case 383: return SCK_STATX;
         case 6: return SCK_CLOSE;
         case 41: return SCK_DUP;
         case 63: return SCK_DUP;  // dup2
@@ -263,8 +294,25 @@ quint64 XEmuLinuxSyscalls::_sysMmap(XEmuRegisters *pRegisters, bool bPageOffset)
     quint64 nLen = _arg(pRegisters, 1);
     quint64 nProt = _arg(pRegisters, 2);
     quint64 nFlags = _arg(pRegisters, 3);
-    qint64 nFd = (qint64)_arg(pRegisters, 4);
+    qint64 nFd = m_bIs64 ? (qint64)_arg(pRegisters, 4) : (qint32)_arg(pRegisters, 4);
     quint64 nFileOffset = _arg(pRegisters, 5);
+
+    if (!m_bIs64 && _number(pRegisters) == 90) {
+        // Legacy i386 mmap takes a pointer to six 32-bit arguments in EBX.
+        const XADDR arguments = nAddr;
+        quint32 values[6] = {};
+        for (int i = 0; i < 6; ++i) {
+            bool ok = false;
+            values[i] = m_pMemoryManager->readDword(arguments + i * 4, &ok);
+            if (!ok) return errnoRet(14);
+        }
+        nAddr = values[0];
+        nLen = values[1];
+        nProt = values[2];
+        nFlags = values[3];
+        nFd = (qint32)values[4];
+        nFileOffset = values[5];
+    }
 
     if (bPageOffset) {
         nFileOffset *= XEmuMemoryManager::N_PAGE_SIZE;  // mmap2: offset is in pages
@@ -364,19 +412,31 @@ quint64 XEmuLinuxSyscalls::_sysOpen(XEmuRegisters *pRegisters, bool bMemfd, quin
     bool bSelf = sPath.isEmpty() || sPath.contains(QStringLiteral("/proc/self/exe")) || sPath.contains(QStringLiteral("/proc/self/fd/")) ||
                  (!m_sSelfPath.isEmpty() && (sPath == m_sSelfPath));
 
-    int nFd = _newFd();
     FAKE_FILE file;
     bool bBacked = false;
 
     if (bReadOnly && bSelf && !m_baSelfExe.isEmpty()) {
         file.baData = m_baSelfExe;
         bBacked = true;
-    } else if (bReadOnly && !bSelf) {
-        // Missing file (e.g. the interpreter / a shared library): report ENOENT.
-        _log(QStringLiteral("open(\"%1\") = -ENOENT").arg(sPath));
-        return errnoRet(2);
+    } else if (!bMemfd) {
+        const QString hostPath = _hostPath(sPath);
+        if (hostPath.isEmpty()) return errnoRet(2);
+        const QFileInfo info(hostPath);
+        const bool exists = info.exists();
+        if (!exists && !(nFlags & O_CREAT)) return errnoRet(2);
+        if (exists && (nFlags & O_CREAT) && (nFlags & 0x80)) return errnoRet(17);
+        if (exists && (!info.isFile() || info.size() > 64 * 1024 * 1024)) return errnoRet(22);
+        if (exists && !(nFlags & 0x200)) {
+            QFile source(hostPath);
+            if (!source.open(QIODevice::ReadOnly)) return errnoRet(13);
+            file.baData = source.readAll();
+        }
+        file.sHostPath = hostPath;
+        file.bDirty = !exists || ((nFlags & 0x200) != 0);
+        if (nFlags & 0x400) file.nOffset = file.baData.size();
     }
 
+    int nFd = _newFd();
     m_files.insert(nFd, file);
     _log(QStringLiteral("%1(\"%2\") = fd %3 (%4 bytes)%5")
              .arg(bMemfd ? QStringLiteral("memfd_create") : QStringLiteral("open"))
@@ -385,6 +445,20 @@ quint64 XEmuLinuxSyscalls::_sysOpen(XEmuRegisters *pRegisters, bool bMemfd, quin
              .arg(file.baData.size())
              .arg(bBacked ? QStringLiteral(" [self]") : QString()));
     return (quint64)nFd;
+}
+
+QString XEmuLinuxSyscalls::_hostPath(const QString &guestPath) const
+{
+    if (m_sWorkingDirectory.isEmpty() || guestPath.isEmpty() || QDir::isAbsolutePath(guestPath) || guestPath.contains(QLatin1Char(':'))) {
+        return QString();
+    }
+    const QString path = QDir(m_sWorkingDirectory).absoluteFilePath(guestPath);
+    const QFileInfo info(path);
+    const QString resolved = info.exists() ? info.canonicalFilePath() : QFileInfo(info.absolutePath()).canonicalFilePath() + QDir::separator() + info.fileName();
+    const QString root = QDir::cleanPath(QDir::fromNativeSeparators(m_sWorkingDirectory));
+    const QString clean = QDir::cleanPath(QDir::fromNativeSeparators(resolved));
+    if (!clean.startsWith(root + QLatin1Char('/'), Qt::CaseInsensitive)) return QString();
+    return clean;
 }
 
 quint64 XEmuLinuxSyscalls::_sysReadlink(XEmuRegisters *pRegisters)
@@ -410,7 +484,9 @@ quint64 XEmuLinuxSyscalls::_sysFtruncate(XEmuRegisters *pRegisters)
     if (!m_files.contains(nFd)) {
         return errnoRet(9);  // EBADF
     }
+    if (nLen > 64 * 1024 * 1024) return errnoRet(27);
     m_files[nFd].baData.resize((int)nLen);  // zero-extends or truncates
+    m_files[nFd].bDirty = !m_files[nFd].sHostPath.isEmpty();
     return 0;
 }
 
@@ -433,6 +509,25 @@ quint64 XEmuLinuxSyscalls::_sysLseek(XEmuRegisters *pRegisters)
     return file.nOffset;
 }
 
+quint64 XEmuLinuxSyscalls::_sysLseek64(XEmuRegisters *pRegisters)
+{
+    const int fd = (int)_arg(pRegisters, 0);
+    if (!m_files.contains(fd)) return errnoRet(9);
+    const quint64 rawOffset = (_arg(pRegisters, 1) << 32) | _arg(pRegisters, 2);
+    const qint64 offset = static_cast<qint64>(rawOffset);
+    const XADDR resultAddress = (XADDR)_arg(pRegisters, 3);
+    const quint64 whence = _arg(pRegisters, 4);
+    const FAKE_FILE &file = m_files[fd];
+    if (whence > 2) return errnoRet(22);
+    const qint64 base = whence == 1 ? static_cast<qint64>(file.nOffset)
+                                  : whence == 2 ? file.baData.size() : 0;
+    if (offset < -base || offset > 64 * 1024 * 1024 - base) return errnoRet(22);
+    const quint64 position = static_cast<quint64>(base + offset);
+    if (!m_pMemoryManager->writeQword(resultAddress, position)) return errnoRet(14);
+    m_files[fd].nOffset = position;
+    return 0;
+}
+
 quint64 XEmuLinuxSyscalls::_sysPwrite(XEmuRegisters *pRegisters)
 {
     int nFd = (int)_arg(pRegisters, 0);
@@ -447,27 +542,104 @@ quint64 XEmuLinuxSyscalls::_sysPwrite(XEmuRegisters *pRegisters)
     QByteArray baBuf = _readMem(nBuf, nCount);
     QByteArray &baFile = m_files[nFd].baData;
     quint64 nNeeded = nOffset + (quint64)baBuf.size();
+    if (nCount > 64 * 1024 * 1024 || nNeeded > 64 * 1024 * 1024) return errnoRet(27);
     if ((quint64)baFile.size() < nNeeded) {
         baFile.resize((int)nNeeded);
     }
     memcpy(baFile.data() + nOffset, baBuf.constData(), baBuf.size());
+    _syncFileToMaps(nFd, nOffset, baBuf);
+    m_files[nFd].bDirty = !m_files[nFd].sHostPath.isEmpty();
     return (quint64)baBuf.size();
+}
+
+bool XEmuLinuxSyscalls::_writeStat(XADDR address, quint64 size, bool directory) const
+{
+    const quint32 mode = directory ? 0040755u : 0100644u;
+    if (!m_pMemoryManager->write(address, QByteArray(m_bIs64 ? 144 : 96, 0))) return false;
+    if (m_bIs64) {
+        return m_pMemoryManager->writeQword(address, 1) &&
+               m_pMemoryManager->writeQword(address + 8, 1) &&
+               m_pMemoryManager->writeQword(address + 16, 1) &&
+               m_pMemoryManager->writeDword(address + 24, mode) &&
+               m_pMemoryManager->writeQword(address + 48, size) &&
+               m_pMemoryManager->writeQword(address + 56, 4096) &&
+               m_pMemoryManager->writeQword(address + 64, (size + 511) / 512);
+    }
+    return m_pMemoryManager->writeQword(address, 1) &&
+           m_pMemoryManager->writeDword(address + 12, 1) &&
+           m_pMemoryManager->writeDword(address + 16, mode) &&
+           m_pMemoryManager->writeDword(address + 20, 1) &&
+           m_pMemoryManager->writeQword(address + 44, size) &&
+           m_pMemoryManager->writeDword(address + 52, 4096) &&
+           m_pMemoryManager->writeQword(address + 56, (size + 511) / 512) &&
+           m_pMemoryManager->writeQword(address + 88, 1);
 }
 
 quint64 XEmuLinuxSyscalls::_sysFstat(XEmuRegisters *pRegisters)
 {
-    int nFd = (int)_arg(pRegisters, 0);
-    XADDR nStatBuf = (XADDR)_arg(pRegisters, 1);
+    const int fd = (int)_arg(pRegisters, 0);
+    const XADDR address = (XADDR)_arg(pRegisters, 1);
+    if (fd >= 0 && fd <= 2) return _writeStat(address, 0, false) ? 0 : errnoRet(14);
+    if (!m_files.contains(fd)) return errnoRet(9);
+    return _writeStat(address, m_files[fd].baData.size(), false) ? 0 : errnoRet(14);
+}
 
-    // newfstatat passes the buffer in arg2; a fake path in arg1.
-    if (!m_files.contains(nFd) && m_files.contains((int)_arg(pRegisters, 0))) {
-        // (kept simple: only the fd form is modelled)
+quint64 XEmuLinuxSyscalls::_sysStat(XEmuRegisters *pRegisters, quint64 number)
+{
+    const bool at = m_bIs64 && number == 262;
+    const QString guestPath = _readStr((XADDR)_arg(pRegisters, at ? 1 : 0));
+    const XADDR address = (XADDR)_arg(pRegisters, at ? 2 : 1);
+    const QString hostPath = _hostPath(guestPath);
+    if (hostPath.isEmpty()) return errnoRet(2);
+    const QFileInfo info(hostPath);
+    if (!info.exists()) return errnoRet(2);
+    return _writeStat(address, info.size(), info.isDir()) ? 0 : errnoRet(14);
+}
+
+quint64 XEmuLinuxSyscalls::_sysStatx(XEmuRegisters *pRegisters)
+{
+    const QString guestPath = _readStr((XADDR)_arg(pRegisters, 1));
+    const XADDR address = (XADDR)_arg(pRegisters, 4);
+    const bool byFd = guestPath.isEmpty() && (_arg(pRegisters, 2) & 0x1000);
+    quint64 size = 0;
+    bool directory = false;
+    if (byFd) {
+        const int fd = (int)_arg(pRegisters, 0);
+        if (!m_files.contains(fd)) return errnoRet(9);
+        size = m_files[fd].baData.size();
+    } else {
+        const QString hostPath = _hostPath(guestPath);
+        if (hostPath.isEmpty()) return errnoRet(2);
+        const QFileInfo info(hostPath);
+        if (!info.exists()) return errnoRet(2);
+        size = info.size();
+        directory = info.isDir();
     }
+    if (!m_pMemoryManager->write(address, QByteArray(256, 0)) ||
+        !m_pMemoryManager->writeDword(address, 0x7ff) ||
+        !m_pMemoryManager->writeDword(address + 4, 4096) ||
+        !m_pMemoryManager->writeDword(address + 16, 1) ||
+        !m_pMemoryManager->writeWord(address + 28, directory ? 0040755u : 0100644u) ||
+        !m_pMemoryManager->writeQword(address + 32, 1) ||
+        !m_pMemoryManager->writeQword(address + 40, size) ||
+        !m_pMemoryManager->writeQword(address + 48, (size + 511) / 512)) {
+        return errnoRet(14);
+    }
+    return 0;
+}
 
-    if (m_files.contains(nFd) && (nStatBuf != 0)) {
-        // struct stat (x86-64): st_size is a 64-bit field at offset 48.
-        m_pMemoryManager->writeQword(nStatBuf + 48, (quint64)m_files[nFd].baData.size());
-        return 0;
+quint64 XEmuLinuxSyscalls::_sysClose(XEmuRegisters *pRegisters)
+{
+    const int fd = (int)_arg(pRegisters, 0);
+    if (!m_files.contains(fd)) return fd >= 0 && fd <= 2 ? 0 : errnoRet(9);
+    FAKE_FILE &file = m_files[fd];
+    if (file.bDirty && !file.sHostPath.isEmpty()) {
+        QSaveFile output(file.sHostPath);
+        if (!output.open(QIODevice::WriteOnly) || output.write(file.baData) != file.baData.size() || !output.commit()) {
+            return errnoRet(5);
+        }
+        file.bDirty = false;
+        _log(QStringLiteral("close(%1): saved %2 bytes to %3").arg(fd).arg(file.baData.size()).arg(file.sHostPath));
     }
     return 0;
 }
@@ -546,6 +718,24 @@ quint64 XEmuLinuxSyscalls::_sysArchPrctl(XEmuRegisters *pRegisters)
     return 0;
 }
 
+quint64 XEmuLinuxSyscalls::_sysSetThreadArea(XEmuRegisters *pRegisters)
+{
+    const XADDR descriptorAddress = (XADDR)_arg(pRegisters, 0);
+    bool ok = false;
+    quint32 entry = m_pMemoryManager->readDword(descriptorAddress, &ok);
+    if (!ok) return errnoRet(14);
+    const quint32 base = m_pMemoryManager->readDword(descriptorAddress + 4, &ok);
+    if (!ok) return errnoRet(14);
+    if (entry == 0xffffffffu) entry = 6;
+    if (entry < 6 || entry > 8) return errnoRet(22);
+    if (!m_pMemoryManager->writeDword(descriptorAddress, entry)) return errnoRet(14);
+    XEmuX86 *x86 = dynamic_cast<XEmuX86 *>(m_pArch);
+    if (!x86) return errnoRet(22);
+    x86->setSelectorDescriptor(static_cast<quint16>((entry << 3) | 3), base, 0xffffffffu, true);
+    _log(QStringLiteral("set_thread_area(entry=%1, base=0x%2)").arg(entry).arg(base, 0, 16));
+    return 0;
+}
+
 quint64 XEmuLinuxSyscalls::_sysWrite(XEmuRegisters *pRegisters)
 {
     int nFd = (int)_arg(pRegisters, 0);
@@ -558,11 +748,14 @@ quint64 XEmuLinuxSyscalls::_sysWrite(XEmuRegisters *pRegisters)
         QByteArray baBuf = _readMem(nBuf, nCount);
         FAKE_FILE &file = m_files[nFd];
         quint64 nNeeded = file.nOffset + (quint64)baBuf.size();
+        if (nCount > 64 * 1024 * 1024 || nNeeded > 64 * 1024 * 1024) return errnoRet(27);
         if ((quint64)file.baData.size() < nNeeded) {
             file.baData.resize((int)nNeeded);
         }
         memcpy(file.baData.data() + file.nOffset, baBuf.constData(), baBuf.size());
+        _syncFileToMaps(nFd, file.nOffset, baBuf);
         file.nOffset += (quint64)baBuf.size();
+        file.bDirty = !file.sHostPath.isEmpty();
         return (quint64)baBuf.size();
     }
 
@@ -574,6 +767,45 @@ quint64 XEmuLinuxSyscalls::_sysWrite(XEmuRegisters *pRegisters)
     }
 
     return nCount;  // pretend the whole buffer was written
+}
+
+quint64 XEmuLinuxSyscalls::_sysWritev(XEmuRegisters *pRegisters)
+{
+    const int fd = (int)_arg(pRegisters, 0);
+    const XADDR vector = (XADDR)_arg(pRegisters, 1);
+    const quint64 count = _arg(pRegisters, 2);
+    if (count > 1024) return errnoRet(22);
+    const int ptrSize = m_bIs64 ? 8 : 4;
+    QByteArray output;
+    for (quint64 i = 0; i < count; ++i) {
+        bool ok = false;
+        const XADDR entry = vector + i * ptrSize * 2;
+        const XADDR address = m_bIs64 ? m_pMemoryManager->readQword(entry, &ok)
+                                       : m_pMemoryManager->readDword(entry, &ok);
+        if (!ok) return errnoRet(14);
+        const quint64 size = m_bIs64 ? m_pMemoryManager->readQword(entry + ptrSize, &ok)
+                                     : m_pMemoryManager->readDword(entry + ptrSize, &ok);
+        if (!ok || size > 0x100000 || output.size() > 0x100000 - size) return errnoRet(22);
+        const QByteArray part = _readMem(address, size);
+        if (part.size() != static_cast<int>(size)) return errnoRet(14);
+        output.append(part);
+    }
+    if (fd == 1 || fd == 2) {
+        _log(QStringLiteral("writev(%1): %2").arg(fd).arg(QString::fromUtf8(output).trimmed()));
+        return output.size();
+    }
+    if (m_files.contains(fd)) {
+        FAKE_FILE &file = m_files[fd];
+        if (file.nOffset + (quint64)output.size() > 64 * 1024 * 1024) return errnoRet(27);
+        const quint64 needed = file.nOffset + (quint64)output.size();
+        if ((quint64)file.baData.size() < needed) file.baData.resize((int)needed);
+        memcpy(file.baData.data() + file.nOffset, output.constData(), output.size());
+        _syncFileToMaps(fd, file.nOffset, output);
+        file.nOffset = needed;
+        file.bDirty = !file.sHostPath.isEmpty();
+        return output.size();
+    }
+    return errnoRet(9);
 }
 
 QString XEmuLinuxSyscalls::_readStr(XADDR nAddress, int nMax) const
@@ -672,6 +904,14 @@ bool XEmuLinuxSyscalls::dispatch(XEmuRegisters *pRegisters)
 {
     quint64 nNumber = _number(pRegisters);
     SCK_KIND kind = _classify(nNumber);
+    if (qEnvironmentVariableIsSet("XEMU_LINUX_SYSCALLS")) {
+        _log(QStringLiteral("syscall %1(0x%2, 0x%3, 0x%4, 0x%5)")
+                 .arg(nNumber)
+                 .arg(_arg(pRegisters, 0), 0, 16)
+                 .arg(_arg(pRegisters, 1), 0, 16)
+                 .arg(_arg(pRegisters, 2), 0, 16)
+                 .arg(_arg(pRegisters, 3), 0, 16));
+    }
 
     switch (kind) {
         case SCK_MMAP: _return(pRegisters, _sysMmap(pRegisters, false)); return true;
@@ -700,8 +940,9 @@ bool XEmuLinuxSyscalls::dispatch(XEmuRegisters *pRegisters)
         }
         case SCK_BRK: _return(pRegisters, _sysBrk(pRegisters)); return true;
         case SCK_ARCH_PRCTL: _return(pRegisters, _sysArchPrctl(pRegisters)); return true;
-        case SCK_SET_THREAD_AREA: _return(pRegisters, 0); return true;
+        case SCK_SET_THREAD_AREA: _return(pRegisters, _sysSetThreadArea(pRegisters)); return true;
         case SCK_WRITE: _return(pRegisters, _sysWrite(pRegisters)); return true;
+        case SCK_WRITEV: _return(pRegisters, _sysWritev(pRegisters)); return true;
         case SCK_READ: _return(pRegisters, _sysRead(pRegisters)); return true;
         case SCK_OPEN: {
             // open(path, flags, mode): path/flags in arg0/arg1; openat(dirfd, path, flags, mode): arg1/arg2.
@@ -715,9 +956,12 @@ bool XEmuLinuxSyscalls::dispatch(XEmuRegisters *pRegisters)
         case SCK_READLINK: _return(pRegisters, _sysReadlink(pRegisters)); return true;
         case SCK_FTRUNCATE: _return(pRegisters, _sysFtruncate(pRegisters)); return true;
         case SCK_LSEEK: _return(pRegisters, _sysLseek(pRegisters)); return true;
+        case SCK_LSEEK64: _return(pRegisters, _sysLseek64(pRegisters)); return true;
         case SCK_PWRITE: _return(pRegisters, _sysPwrite(pRegisters)); return true;
         case SCK_FSTAT: _return(pRegisters, _sysFstat(pRegisters)); return true;
-        case SCK_CLOSE: _return(pRegisters, 0); return true;  // keep the file for later mmap
+        case SCK_STAT: _return(pRegisters, _sysStat(pRegisters, nNumber)); return true;
+        case SCK_STATX: _return(pRegisters, _sysStatx(pRegisters)); return true;
+        case SCK_CLOSE: _return(pRegisters, _sysClose(pRegisters)); return true;
         case SCK_DUP: _return(pRegisters, _arg(pRegisters, 0)); return true;
         case SCK_EXECVE: return _sysExecve(pRegisters, false);
         case SCK_EXECVEAT: return _sysExecve(pRegisters, true);

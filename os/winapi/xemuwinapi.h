@@ -32,6 +32,8 @@
 #include "xemumemorymanager.h"
 #include "xemuregisters.h"
 
+class QFile;
+
 // Emulated Windows-API layer for the user-mode emulator.
 //
 // Real DLL code cannot be executed by the subset CPU core, so instead of pointing
@@ -50,6 +52,9 @@
 class XEmuWinApi {
 public:
     XEmuWinApi(XEmuMemoryManager *pMemoryManager, XEmuArch *pArch, bool bIs64);
+    ~XEmuWinApi();
+
+    void setProcessContext(const QString &sExecutable, const QString &sArguments, const QString &sWorkingDirectory);
 
     typedef std::function<void(const QString &)> LOG_CALLBACK;
     void setLogger(LOG_CALLBACK fnLog);
@@ -151,6 +156,8 @@ private:
 
     static int _classify(const QString &sLibrary, const QString &sFunction);
     XADDR _allocStub();
+    XADDR _ensureCommandLineA();
+    XADDR _ensureCrtIob();
 
     // Allocate nSize bytes of scratch (R/W/X) and return the base to the guest,
     // cleaning nArgCount stdcall arguments. Shared by the heap-allocation APIs.
@@ -161,6 +168,9 @@ private:
     void _return(XEmuRegisters *pRegisters, quint64 nValue, int nArgCount);
 
     QString _readAnsi(XADDR nAddress, int nMax = 260) const;
+    QString _hostPath(const QString &sGuestPath, bool bWrite) const;
+    void _consoleWrite(const QByteArray &baText, bool bStderr);
+    void _flushConsole();
     XEmuMemoryManager::MEMORY_FLAGS _flagsFromProtect(quint32 nProtect) const;
 
     XADDR _moduleHandle(const QString &sLibraryLower, bool bCreate);
@@ -211,10 +221,21 @@ private:
     QVector<REAL_RANGE> m_realRanges;  // mapped real-DLL image ranges to intercept
 
     QByteArray m_baMainFile;             // main module's on-disk bytes (for anti-tamper file reads)
+    QString m_sCommandLine;
+    QString m_sWorkingDirectory;
+    QString m_sIncludeDirectory;
+    XADDR m_nCommandLineA = 0;
+    XADDR m_nCommandLineW = 0;
+    XADDR m_nCrtIob = 0;
+    QMap<XADDR, QFile *> m_mapHostFiles;
+    QByteArray m_baStdoutPending;
+    QByteArray m_baStderrPending;
     QMap<XADDR, qint64> m_mapFileOffset;  // open file handle -> current byte offset
     QMap<XADDR, bool> m_mapSectionIsFile;  // section handle -> backed by the main-module file
     XADDR m_nNextFileHandle;             // next synthetic file/section handle to hand out
     QMap<XADDR, quint64> m_heapSizes;    // alloc base -> requested size (for HeapSize/RtlSizeHeap)
+    QMap<quint32, XADDR> m_tlsValues;
+    quint32 m_nNextTlsIndex = 1;
 
     XADDR m_nFakeHandleCursor;
     bool m_bProcessExited;  // guest called ExitProcess/TerminateProcess

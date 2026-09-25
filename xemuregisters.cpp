@@ -53,6 +53,10 @@ void XEmuRegisters::reset()
     for (int i = 0; i < 8; i++) {
         nMMX[i] = 0;
     }
+    for (int i = 0; i < 16; i++) {
+        nXMM[i][0] = 0;
+        nXMM[i][1] = 0;
+    }
 }
 
 quint64 XEmuRegisters::getGPR(qint32 nIndex, qint32 nSize) const

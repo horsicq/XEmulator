@@ -69,6 +69,7 @@ public:
     // re-opening itself through /proc/self/exe to read its compressed payload) is
     // backed by these, and readlink() reports this path.
     void setSelfExe(const QByteArray &baBytes, const QString &sPath) override;
+    void setWorkingDirectory(const QString &path);
 
     // Service the pending syscall. Returns true to continue execution, false when
     // the process has exited (exit / exit_group) or replaced itself (execve).
@@ -96,13 +97,17 @@ private:
         SCK_ARCH_PRCTL,
         SCK_SET_THREAD_AREA,
         SCK_WRITE,
+        SCK_WRITEV,
         SCK_READ,
         SCK_OPEN,
         SCK_MEMFD,
         SCK_FTRUNCATE,
         SCK_LSEEK,
+        SCK_LSEEK64,
         SCK_PWRITE,
         SCK_FSTAT,
+        SCK_STAT,
+        SCK_STATX,
         SCK_CLOSE,
         SCK_DUP,
         SCK_READLINK,
@@ -117,8 +122,10 @@ private:
     struct FAKE_FILE {
         QByteArray baData;
         quint64 nOffset;
+        QString sHostPath;
+        bool bDirty;
 
-        FAKE_FILE() : nOffset(0)
+        FAKE_FILE() : nOffset(0), bDirty(false)
         {
         }
     };
@@ -142,19 +149,28 @@ private:
 
     int _newFd();
     void _syncMapsToFile(int nFd);  // flush shared mappings of nFd back into its file
+    void _syncFileToMaps(int nFd, quint64 offset, const QByteArray &bytes);
 
     quint64 _sysMmap(XEmuRegisters *pRegisters, bool bPageOffset);
     quint64 _sysMprotect(XEmuRegisters *pRegisters);
     quint64 _sysBrk(XEmuRegisters *pRegisters);
     quint64 _sysArchPrctl(XEmuRegisters *pRegisters);
+    quint64 _sysSetThreadArea(XEmuRegisters *pRegisters);
     quint64 _sysWrite(XEmuRegisters *pRegisters);
+    quint64 _sysWritev(XEmuRegisters *pRegisters);
     quint64 _sysRead(XEmuRegisters *pRegisters);
     quint64 _sysOpen(XEmuRegisters *pRegisters, bool bMemfd, quint64 nFlags, const QString &sPath);
     quint64 _sysReadlink(XEmuRegisters *pRegisters);
     quint64 _sysFtruncate(XEmuRegisters *pRegisters);
     quint64 _sysLseek(XEmuRegisters *pRegisters);
+    quint64 _sysLseek64(XEmuRegisters *pRegisters);
     quint64 _sysPwrite(XEmuRegisters *pRegisters);
     quint64 _sysFstat(XEmuRegisters *pRegisters);
+    quint64 _sysStat(XEmuRegisters *pRegisters, quint64 number);
+    quint64 _sysStatx(XEmuRegisters *pRegisters);
+    quint64 _sysClose(XEmuRegisters *pRegisters);
+    bool _writeStat(XADDR address, quint64 size, bool directory) const;
+    QString _hostPath(const QString &guestPath) const;
     bool _sysExecve(XEmuRegisters *pRegisters, bool bExecveAt);  // returns false (process replaced)
 
     QString _readStr(XADDR nAddress, int nMax = 512) const;
@@ -184,6 +200,7 @@ private:
 
     QByteArray m_baSelfExe;  // the packed executable's own bytes
     QString m_sSelfPath;
+    QString m_sWorkingDirectory;
 };
 
 #endif  // XEMULINUXSYSCALLS_H

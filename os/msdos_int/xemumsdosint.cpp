@@ -1238,6 +1238,11 @@ void XEmuMsdosInt::int21(XEmuRegisters *pRegisters, bool *pbTerminate)
             break;
         }
 
+        case 0x71:  // LFN API unavailable: clients may retry with classic DOS file calls.
+            pRegisters->setGPR(XEmuRegisters::GPR_RAX, 2, 0x7100);
+            setCF(pRegisters, true);
+            break;
+
         default:
             _log(QStringLiteral("INT 21h AH=0x%1 not modelled (AX=0x%2) -> CF")
                      .arg(nAH, 2, 16, QChar('0'))

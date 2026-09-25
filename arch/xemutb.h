@@ -45,6 +45,7 @@ struct XEmuOperand {
     int nReg;        // register index for a register operand
     bool bHigh8;     // byte operand is a high-byte register (AH/CH/DH/BH); accesses bits 8..15 of nReg
     bool bMMX;       // register operand is an MMX register (MM0-MM7); nReg is 0..7
+    bool bXMM;       // register operand is an XMM register (XMM0-XMM15)
     int nBaseReg;    // memory base register index, or -1
     int nIndexReg;   // memory index register index, or -1
     int nScale;      // 1/2/4/8
@@ -52,7 +53,7 @@ struct XEmuOperand {
     bool bRipRel;    // RIP-relative (address = insn_pc + insn_len + disp)
     int nSegSource;  // 0 none, 1 FS, 2 GS, 3 ES, 4 CS, 5 SS, 6 DS
 
-    XEmuOperand() : bIsReg(false), bIsMem(false), nReg(0), bHigh8(false), bMMX(false), nBaseReg(-1), nIndexReg(-1), nScale(1), nDisp(0), bRipRel(false), nSegSource(0)
+    XEmuOperand() : bIsReg(false), bIsMem(false), nReg(0), bHigh8(false), bMMX(false), bXMM(false), nBaseReg(-1), nIndexReg(-1), nScale(1), nDisp(0), bRipRel(false), nSegSource(0)
     {
     }
 
@@ -70,6 +71,15 @@ struct XEmuOperand {
         operand.bIsReg = true;
         operand.bMMX = true;
         operand.nReg = nRegIndex & 7;
+        return operand;
+    }
+
+    static XEmuOperand xmm(int nRegIndex)
+    {
+        XEmuOperand operand;
+        operand.bIsReg = true;
+        operand.bXMM = true;
+        operand.nReg = nRegIndex & 15;
         return operand;
     }
 
@@ -136,9 +146,11 @@ enum XEmuMicroOpKind {
     MOP_BSF,          // bit scan forward (0F BC): dst = index of lowest set bit of src; ZF=1 if src==0
     MOP_BSR,          // bit scan reverse (0F BD): dst = index of highest set bit of src; ZF=1 if src==0
     MOP_XADD,         // exchange-and-add (0F C0/C1): tmp=dst+src (ADD flags); src=dst; dst=tmp
+    MOP_CMPXCHG,      // compare accumulator with r/m; store reg on match, otherwise load r/m into accumulator
     MOP_BT,           // bit test group: BT/BTS/BTR/BTC  (nAluOp: 0 BT, 1 BTS, 2 BTR, 3 BTC; nCond: 0 imm8 index, 1 register index). CF = tested bit.
     MOP_SHIFTD,       // double-precision shift SHLD/SHRD (0F A4/A5/AC/AD)  (nAluOp: 0 SHLD, 1 SHRD; nCond: 0 imm8 count, 1 CL). dst=r/m, src=reg.
     MOP_MMX,          // MMX packed-integer op  (nAluOp: MMXOP id; dst/src MMX regs or m64; MOVD uses r/m32). nCond: 1 = shift count is imm8.
+    MOP_SSE,          // SSE/SSE2 XMM operation
     MOP_IMUL2,        // reg = reg * rm (signed, truncated)  (0F AF; three-operand via nImm when nSrcSize<0)
     MOP_LOOP,         // loopne/loope/loop/jecxz  (nAluOp: opcode - 0xE0)
     MOP_SYSCALL,      // syscall / int 0x80  (nAluOp: 0 syscall, 1 int 0x80)
@@ -172,6 +184,7 @@ enum XEmuMicroOpKind {
 struct XEmuMicroOp {
     XEmuMicroOpKind kind;
     int nSize;       // operation width in bytes (1/2/4/8)
+    int nAddrSize;   // effective-address width in bytes (2/4/8)
     int nSrcSize;    // source width (MOVZX/MOVSX)
     int nAluOp;      // ALU operation id / inc-dec selector
     quint8 nCond;    // condition code (Jcc/SETcc)
@@ -183,7 +196,7 @@ struct XEmuMicroOp {
     XADDR nBranchTarget;  // absolute target for direct control transfers
     QString sText;        // short mnemonic (for tracing)
 
-    XEmuMicroOp() : kind(MOP_NOP), nSize(4), nSrcSize(1), nAluOp(0), nCond(0), nImm(0), nAddress(0), nLength(0), nBranchTarget(0)
+    XEmuMicroOp() : kind(MOP_NOP), nSize(4), nAddrSize(4), nSrcSize(1), nAluOp(0), nCond(0), nImm(0), nAddress(0), nLength(0), nBranchTarget(0)
     {
     }
 

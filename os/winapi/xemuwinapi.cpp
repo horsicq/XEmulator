@@ -21,6 +21,12 @@
 #include "xemuwinapi.h"
 
 #include <cstdio>
+#include <limits>
+
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 
 // Win32 memory-protection constants (winnt.h values).
 static const quint32 PAGE_NOACCESS_V = 0x01;
@@ -35,6 +41,93 @@ XEmuWinApi::XEmuWinApi(XEmuMemoryManager *pMemoryManager, XEmuArch *pArch, bool 
     : m_pMemoryManager(pMemoryManager), m_pArch(pArch), m_bIs64(bIs64), m_nMainModuleBase(0), m_nStubBase(0), m_nStubSize(0), m_nStubCursor(0),
       m_nFakeHandleCursor(0xE0000000), m_bProcessExited(false), m_nNextFileHandle(0x00000F00)
 {
+}
+
+XEmuWinApi::~XEmuWinApi()
+{
+    qDeleteAll(m_mapHostFiles);
+}
+
+void XEmuWinApi::setProcessContext(const QString &sExecutable, const QString &sArguments, const QString &sWorkingDirectory)
+{
+    const QString sExecutablePath = QFileInfo(sExecutable).absoluteFilePath();
+    const QString sRoot = sWorkingDirectory.isEmpty() ? QFileInfo(sExecutablePath).absolutePath() : sWorkingDirectory;
+    m_sWorkingDirectory = QDir(sRoot).canonicalPath();
+    if (m_sWorkingDirectory.isEmpty()) {
+        m_sWorkingDirectory = QDir(sRoot).absolutePath();
+    }
+    m_sIncludeDirectory = QDir(QFileInfo(sExecutablePath).absolutePath()).filePath(QStringLiteral("INCLUDE"));
+    m_sIncludeDirectory = QDir(m_sIncludeDirectory).canonicalPath();
+    m_sCommandLine = QStringLiteral("\"%1\"").arg(QDir::toNativeSeparators(sExecutablePath));
+    if (!sArguments.isEmpty()) {
+        m_sCommandLine += QLatin1Char(' ') + sArguments;
+    }
+}
+
+QString XEmuWinApi::_hostPath(const QString &sGuestPath, bool bWrite) const
+{
+    QString sRelative = sGuestPath;
+    sRelative.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    const QString sAlias = QStringLiteral("FASM_INCLUDE/");
+    const bool bInclude = sRelative.startsWith(sAlias, Qt::CaseInsensitive);
+    if (bInclude) {
+        if (bWrite || m_sIncludeDirectory.isEmpty()) return QString();
+        sRelative = sRelative.mid(sAlias.size());
+    }
+    if (sRelative.isEmpty() || sRelative.startsWith(QLatin1Char('/')) || sRelative.contains(QLatin1Char(':'))) {
+        return QString();
+    }
+
+    const QString sRoot = QDir::cleanPath(bInclude ? m_sIncludeDirectory : m_sWorkingDirectory);
+    const QString sCandidate = QDir::cleanPath(QDir(sRoot).absoluteFilePath(sRelative));
+#ifdef Q_OS_WIN
+    constexpr Qt::CaseSensitivity comparison = Qt::CaseInsensitive;
+#else
+    constexpr Qt::CaseSensitivity comparison = Qt::CaseSensitive;
+#endif
+    if (!sCandidate.startsWith(sRoot + QLatin1Char('/'), comparison)) {
+        return QString();
+    }
+
+    const QFileInfo fileInfo(sCandidate);
+    if (fileInfo.isSymLink()) {
+        return QString();
+    }
+    const QString sResolved = fileInfo.exists() ? fileInfo.canonicalFilePath() : fileInfo.dir().canonicalPath();
+    if (sResolved.isEmpty() || (sResolved.compare(sRoot, comparison) != 0 &&
+                                !sResolved.startsWith(sRoot + QLatin1Char('/'), comparison))) {
+        return QString();
+    }
+    return sCandidate;
+}
+
+void XEmuWinApi::_consoleWrite(const QByteArray &baText, bool bStderr)
+{
+    QByteArray &pending = bStderr ? m_baStderrPending : m_baStdoutPending;
+    pending += baText;
+    while (true) {
+        const qsizetype nEnd = pending.indexOf('\n');
+        if (nEnd < 0) {
+            break;
+        }
+        QByteArray line = pending.left(nEnd);
+        if (line.endsWith('\r')) {
+            line.chop(1);
+        }
+        _log(QStringLiteral("[%1] %2").arg(bStderr ? QStringLiteral("stderr") : QStringLiteral("stdout"), QString::fromLocal8Bit(line)));
+        pending.remove(0, nEnd + 1);
+    }
+}
+
+void XEmuWinApi::_flushConsole()
+{
+    for (bool bStderr : {false, true}) {
+        QByteArray &pending = bStderr ? m_baStderrPending : m_baStdoutPending;
+        if (!pending.isEmpty()) {
+            _log(QStringLiteral("[%1] %2").arg(bStderr ? QStringLiteral("stderr") : QStringLiteral("stdout"), QString::fromLocal8Bit(pending)));
+            pending.clear();
+        }
+    }
 }
 
 void XEmuWinApi::setMainModuleFile(const QByteArray &baFile)
@@ -200,6 +293,39 @@ XADDR XEmuWinApi::_allocStub()
     return nStub;
 }
 
+XADDR XEmuWinApi::_ensureCommandLineA()
+{
+    if (!m_nCommandLineA) {
+        QByteArray bytes = m_sCommandLine.toLocal8Bit();
+        bytes.append('\0');
+        m_nCommandLineA = m_pMemoryManager->allocate(0, (XADDR)bytes.size(),
+            XEmuMemoryManager::MEMORY_FLAGS(true, true, false), QStringLiteral("GetCommandLineA"));
+        if (m_nCommandLineA) {
+            m_pMemoryManager->write(m_nCommandLineA, bytes);
+        }
+    }
+    return m_nCommandLineA;
+}
+
+XADDR XEmuWinApi::_ensureCrtIob()
+{
+    if (!m_nCrtIob) {
+        const XADDR recordSize = m_bIs64 ? 0x30 : 0x20;
+        const XADDR fileOffset = m_bIs64 ? 0x1c : 0x10;
+        const XADDR flagsOffset = m_bIs64 ? 0x18 : 0x0c;
+        m_nCrtIob = m_pMemoryManager->allocate(0, recordSize * 3,
+            XEmuMemoryManager::MEMORY_FLAGS(true, true, false), QStringLiteral("msvcrt_iob"));
+        if (m_nCrtIob) {
+            for (int i = 0; i < 3; ++i) {
+                const XADDR entry = m_nCrtIob + recordSize * i;
+                m_pMemoryManager->writeDword(entry + fileOffset, i);
+                m_pMemoryManager->writeDword(entry + flagsOffset, i == 0 ? 1 : 2);
+            }
+        }
+    }
+    return m_nCrtIob;
+}
+
 bool XEmuWinApi::resolveImportStub(XADDR nStub, QString *pLibrary, QString *pFunction, qint64 *pOrdinal) const
 {
     QMap<XADDR, IMPORT_NAME>::const_iterator it = m_mapStubToImport.constFind(nStub);
@@ -235,6 +361,18 @@ XADDR XEmuWinApi::stubFor(const QString &sLibrary, const QString &sFunction, qin
     XADDR nStub = _allocStub();
     m_mapStubToApi.insert(nStub, _classify(sLibrary, sFunc));
     m_mapNameToStub.insert(sKey, nStub);
+
+    // MSVCRT exports _acmdln as data (char **), not as a callable function.
+    // Programs reading it must see a pointer to the process command line.
+    if (sLibrary.compare(QStringLiteral("msvcrt.dll"), Qt::CaseInsensitive) == 0
+        && sFunc == QStringLiteral("_acmdln")) {
+        const XADDR nCommandLine = _ensureCommandLineA();
+        if (m_bIs64) {
+            m_pMemoryManager->writeQword(nStub, nCommandLine);
+        } else {
+            m_pMemoryManager->writeDword(nStub, (quint32)nCommandLine);
+        }
+    }
 
     // Remember the original-case name so import reconstruction can rebuild a real import
     // directory from the trampolines the packer wrote into the IAT.
@@ -776,21 +914,55 @@ void XEmuWinApi::_apiExitProcess(XEmuRegisters *pRegisters)
     // from). Don't touch the stack -- there is no return.
     const quint64 nCode = _arg(pRegisters, 0);
     m_bProcessExited = true;
+    _flushConsole();
     _log(QStringLiteral("ExitProcess(0x%1)").arg(nCode, 0, 16));
 }
 
 void XEmuWinApi::_apiCreateFile(XEmuRegisters *pRegisters)
 {
-    // CreateFileA/W(lpFileName, access, share, sec, disp, flags, hTemplate) -- 7 stdcall args.
-    // Not backed by a real filesystem, so opens fail. Critically, a failed CreateFile returns
-    // INVALID_HANDLE_VALUE (0xFFFFFFFF), NOT 0 (the generic no-op's value): packers probe for
-    // kernel debuggers by opening device names like "\\.\SICE" / "\\.\NTICE" and branch on the
-    // result; a bogus 0 (impossible from real CreateFile) sends them down an error path
-    // (e.g. REVProt clobbers its relocation-base register and faults). -1 = "device absent" =
-    // no debugger, which is what an un-instrumented run should report.
-    const QString sName = _readAnsi((XADDR)_arg(pRegisters, 0));
-    _log(QStringLiteral("CreateFile(\"%1\") = INVALID_HANDLE_VALUE").arg(sName));
-    _return(pRegisters, 0xFFFFFFFFu, 7);
+    const XADDR nName = (XADDR)_arg(pRegisters, 0);
+    const quint32 nAccess = (quint32)_arg(pRegisters, 1);
+    const quint32 nDisposition = (quint32)_arg(pRegisters, 4);
+    const QString sImport = m_mapStubToImport.value(m_pArch->getPC(pRegisters)).sFunction;
+    QString sName;
+    if (sImport == QStringLiteral("CreateFileW")) {
+        for (int i = 0; i < 260; ++i) {
+            const quint16 ch = m_pMemoryManager->readWord(nName + (XADDR)i * 2);
+            if (!ch) break;
+            sName += QChar(ch);
+        }
+    } else {
+        sName = _readAnsi(nName);
+    }
+    const QString sPath = _hostPath(sName, (nAccess & 0x40000000u) != 0 || nDisposition != 3);
+    const bool bExists = !sPath.isEmpty() && QFileInfo::exists(sPath);
+    if (sPath.isEmpty() || (nDisposition == 1 && bExists) ||
+        ((nDisposition == 3 || nDisposition == 5) && !bExists) || nDisposition < 1 || nDisposition > 5) {
+        _log(QStringLiteral("CreateFile(\"%1\") = INVALID_HANDLE_VALUE").arg(sName));
+        _return(pRegisters, 0xFFFFFFFFu, 7);
+        return;
+    }
+
+    const bool bRead = (nAccess & 0x80000000u) != 0;
+    const bool bWrite = (nAccess & 0x40000000u) != 0;
+    QIODevice::OpenMode mode = bRead && bWrite ? QIODevice::ReadWrite : (bWrite ? QIODevice::WriteOnly : QIODevice::ReadOnly);
+    if (!bExists && (nDisposition == 1 || nDisposition == 4)) {
+        mode = QIODevice::ReadWrite | (nDisposition == 1 ? QIODevice::NewOnly : QIODevice::OpenMode());
+    }
+    if (nDisposition == 2 || nDisposition == 5) {
+        mode = (bRead ? QIODevice::ReadWrite : QIODevice::WriteOnly) | QIODevice::Truncate;
+    }
+    QFile *pFile = new QFile(sPath);
+    if (!pFile->open(mode)) {
+        delete pFile;
+        _log(QStringLiteral("CreateFile(\"%1\") failed").arg(sName));
+        _return(pRegisters, 0xFFFFFFFFu, 7);
+        return;
+    }
+    const XADDR nHandle = m_nNextFileHandle++;
+    m_mapHostFiles.insert(nHandle, pFile);
+    _log(QStringLiteral("CreateFile(\"%1\") = 0x%2").arg(sName).arg(nHandle, 0, 16));
+    _return(pRegisters, nHandle, 7);
 }
 
 bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
@@ -800,6 +972,138 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
     }
     const XADDR a1 = (XADDR)_arg(pRegisters, 1);
     const XADDR a2 = (XADDR)_arg(pRegisters, 2);
+
+    if (sFunc == QStringLiteral("malloc")) {
+        _allocReturn(pRegisters, _arg(pRegisters, 0), 0, QStringLiteral("malloc"));
+        return true;
+    }
+    if (sFunc == QStringLiteral("calloc")) {
+        const quint64 count = _arg(pRegisters, 0);
+        const quint64 size = _arg(pRegisters, 1);
+        if (size && count > std::numeric_limits<quint64>::max() / size) {
+            _return(pRegisters, 0, 0);
+        } else {
+            _allocReturn(pRegisters, count * size, 0, QStringLiteral("calloc"));
+        }
+        return true;
+    }
+    if (sFunc == QStringLiteral("free")) {
+        const XADDR address = (XADDR)_arg(pRegisters, 0);
+        if (m_heapSizes.remove(address)) {
+            m_pMemoryManager->release(address);
+        }
+        _return(pRegisters, 0, 0);
+        return true;
+    }
+    if (sFunc == QStringLiteral("realloc")) {
+        const XADDR oldAddress = (XADDR)_arg(pRegisters, 0);
+        const quint64 newSize = _arg(pRegisters, 1);
+        if (!oldAddress) {
+            _allocReturn(pRegisters, newSize, 0, QStringLiteral("realloc"));
+            return true;
+        }
+        if (!newSize) {
+            if (m_heapSizes.remove(oldAddress)) m_pMemoryManager->release(oldAddress);
+            _return(pRegisters, 0, 0);
+            return true;
+        }
+        const quint64 oldSize = m_heapSizes.value(oldAddress, 0);
+        XADDR newAddress = m_pMemoryManager->allocate(0,
+            XEmuMemoryManager::alignUp(newSize, XEmuMemoryManager::N_PAGE_SIZE),
+            XEmuMemoryManager::MEMORY_FLAGS(true, true, true), QStringLiteral("realloc"));
+        if (newAddress) {
+            if (oldSize) {
+                m_pMemoryManager->write(newAddress,
+                    m_pMemoryManager->read(oldAddress, qMin(oldSize, newSize)));
+                m_pMemoryManager->release(oldAddress);
+                m_heapSizes.remove(oldAddress);
+            }
+            m_heapSizes.insert(newAddress, newSize);
+        }
+        _return(pRegisters, newAddress, 0);
+        return true;
+    }
+    if (sFunc == QStringLiteral("strlen")) {
+        const XADDR address = (XADDR)_arg(pRegisters, 0);
+        quint64 length = 0;
+        bool ok = false;
+        while (address && length < 0x100000) {
+            const quint8 value = m_pMemoryManager->readByte(address + length, &ok);
+            if (!ok || !value) break;
+            ++length;
+        }
+        _return(pRegisters, length, 0);
+        return true;
+    }
+    if (sFunc == QStringLiteral("memcpy") || sFunc == QStringLiteral("memmove")) {
+        const XADDR destination = (XADDR)_arg(pRegisters, 0);
+        const XADDR source = (XADDR)_arg(pRegisters, 1);
+        const quint64 count = _arg(pRegisters, 2);
+        if (count <= 0x4000000 && destination && source) {
+            bool ok = false;
+            const QByteArray bytes = m_pMemoryManager->read(source, count, &ok);
+            if (ok) m_pMemoryManager->write(destination, bytes);
+        }
+        _return(pRegisters, destination, 0);
+        return true;
+    }
+    if (sFunc == QStringLiteral("memset")) {
+        const XADDR destination = (XADDR)_arg(pRegisters, 0);
+        const quint8 value = (quint8)_arg(pRegisters, 1);
+        const quint64 count = _arg(pRegisters, 2);
+        if (count <= 0x4000000 && destination) {
+            m_pMemoryManager->write(destination, QByteArray((qsizetype)count, (char)value));
+        }
+        _return(pRegisters, destination, 0);
+        return true;
+    }
+    if (sFunc == QStringLiteral("__iob_func")) {
+        _return(pRegisters, _ensureCrtIob(), 0);
+        return true;
+    }
+    if (sFunc == QStringLiteral("__p__acmdln")) {
+        _return(pRegisters, stubFor(QStringLiteral("msvcrt.dll"), QStringLiteral("_acmdln")), 0);
+        return true;
+    }
+    if (sFunc == QStringLiteral("fwrite")) {
+        const XADDR source = (XADDR)_arg(pRegisters, 0);
+        const quint64 size = _arg(pRegisters, 1);
+        const quint64 count = _arg(pRegisters, 2);
+        const XADDR stream = (XADDR)_arg(pRegisters, 3);
+        const XADDR recordSize = m_bIs64 ? 0x30 : 0x20;
+        if (size && count <= 0x100000 / size && source) {
+            bool ok = false;
+            const QByteArray bytes = m_pMemoryManager->read(source, size * count, &ok);
+            if (ok) {
+                _consoleWrite(bytes, stream == _ensureCrtIob() + recordSize * 2);
+                _return(pRegisters, count, 0);
+                return true;
+            }
+        }
+        _return(pRegisters, 0, 0);
+        return true;
+    }
+    if (sFunc == QStringLiteral("fputs")) {
+        const XADDR source = (XADDR)_arg(pRegisters, 0);
+        const XADDR stream = (XADDR)_arg(pRegisters, 1);
+        const XADDR recordSize = m_bIs64 ? 0x30 : 0x20;
+        QByteArray bytes;
+        bool ok = false;
+        for (quint64 i = 0; source && i < 0x100000; ++i) {
+            const quint8 value = m_pMemoryManager->readByte(source + i, &ok);
+            if (!ok || !value) break;
+            bytes.append((char)value);
+        }
+        if (ok) {
+            _consoleWrite(bytes, stream == _ensureCrtIob() + recordSize * 2);
+        }
+        _return(pRegisters, ok ? 0 : quint64(-1), 0);
+        return true;
+    }
+    if (sFunc == QStringLiteral("_onexit")) {
+        _return(pRegisters, _arg(pRegisters, 0), 0);
+        return true;
+    }
 
     // --- environment / anti-analysis probes (return value + output buffer + stdcall cleanup) ---
     if (sFunc == QStringLiteral("IsWow64Process")) {              // BOOL(HANDLE, PBOOL)
@@ -830,32 +1134,39 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
         return true;
     }
     if (sFunc == QStringLiteral("GetCommandLineA")) {   // LPSTR GetCommandLineA()
-        static const char psz[] = "xvolkolakc";
-        static XADDR nAddress = 0;
-        if (nAddress == 0) {
-            nAddress = m_pMemoryManager->allocate(0, (XADDR)(sizeof(psz)), XEmuMemoryManager::MEMORY_FLAGS(true, true, true), QStringLiteral("GetCommandLineA"));
-            if (nAddress != 0) {
-                for (int i = 0; i < (int)sizeof(psz); i++) {
-                    m_pMemoryManager->writeByte(nAddress + (XADDR)i, (quint8)psz[i]);
-                }
-            }
-        }
-        _return(pRegisters, nAddress, 0);
+        _return(pRegisters, _ensureCommandLineA(), 0);
         return true;
     }
     if (sFunc == QStringLiteral("GetCommandLineW")) {   // LPWSTR GetCommandLineW()
-        static const char psz[] = "xvolkolakc";
-        static XADDR nAddress = 0;
-        if (nAddress == 0) {
-            nAddress = m_pMemoryManager->allocate(0, (XADDR)(sizeof(psz) * 2 + 2), XEmuMemoryManager::MEMORY_FLAGS(true, true, true), QStringLiteral("GetCommandLineW"));
-            if (nAddress != 0) {
-                for (int i = 0; i < (int)sizeof(psz) - 1; i++) {
-                    m_pMemoryManager->writeWord(nAddress + (XADDR)i * 2, (quint8)psz[i]);
+        if (!m_nCommandLineW) {
+            m_nCommandLineW = m_pMemoryManager->allocate(0, (XADDR)(m_sCommandLine.size() + 1) * 2, XEmuMemoryManager::MEMORY_FLAGS(true, true, false), QStringLiteral("GetCommandLineW"));
+            if (m_nCommandLineW) {
+                for (qsizetype i = 0; i < m_sCommandLine.size(); ++i) {
+                    m_pMemoryManager->writeWord(m_nCommandLineW + (XADDR)i * 2, m_sCommandLine.at(i).unicode());
                 }
-                m_pMemoryManager->writeWord(nAddress + (XADDR)(sizeof(psz) - 1) * 2, 0);
+                m_pMemoryManager->writeWord(m_nCommandLineW + (XADDR)m_sCommandLine.size() * 2, 0);
             }
         }
-        _return(pRegisters, nAddress, 0);
+        _return(pRegisters, m_nCommandLineW, 0);
+        return true;
+    }
+    if (sFunc == QStringLiteral("GetEnvironmentVariableA")) {
+        const QString sName = _readAnsi((XADDR)_arg(pRegisters, 0));
+        if (sName.compare(QStringLiteral("INCLUDE"), Qt::CaseInsensitive) == 0 && !m_sIncludeDirectory.isEmpty()) {
+            const QByteArray value = QByteArrayLiteral("FASM_INCLUDE\\");
+            const XADDR nBuffer = (XADDR)_arg(pRegisters, 1);
+            const quint32 nCapacity = (quint32)_arg(pRegisters, 2);
+            if (nBuffer && nCapacity > (quint32)value.size()) {
+                QByteArray terminated = value;
+                terminated.append('\0');
+                m_pMemoryManager->write(nBuffer, terminated);
+                _return(pRegisters, value.size(), 3);
+            } else {
+                _return(pRegisters, value.size() + 1, 3);
+            }
+        } else {
+            _return(pRegisters, 0, 3);
+        }
         return true;
     }
     if ((sFunc == QStringLiteral("GetEnvironmentStrings")) || (sFunc == QStringLiteral("GetEnvironmentStringsA"))) {
@@ -893,6 +1204,17 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
     //     out a valid fake heap handle; HeapAlloc/Free below ignore the handle and use real memory.
     if (sFunc == QStringLiteral("HeapCreate")) { _return(pRegisters, 0x00E70000u, 3); return true; }   // HANDLE(flOptions, dwInit, dwMax)
     if (sFunc == QStringLiteral("GetProcessHeap")) { _return(pRegisters, 0x00E70000u, 0); return true; }
+    if (sFunc == QStringLiteral("CreateSemaphoreA") || sFunc == QStringLiteral("CreateSemaphoreW")) {
+        const XADDR handle = m_nFakeHandleCursor;
+        m_nFakeHandleCursor += 0x10000;
+        _return(pRegisters, handle, 4);
+        return true;
+    }
+    if (sFunc == QStringLiteral("ReleaseSemaphore")) {
+        if (_arg(pRegisters, 2)) m_pMemoryManager->writeDword((XADDR)_arg(pRegisters, 2), 0);
+        _return(pRegisters, 1, 3);
+        return true;
+    }
     if (sFunc == QStringLiteral("HeapDestroy")) { _return(pRegisters, 1, 1); return true; }
     if (sFunc == QStringLiteral("HeapReAlloc")) { _allocReturn(pRegisters, (quint64)_arg(pRegisters, 3), 4, QStringLiteral("HeapReAlloc")); return true; }
     if (sFunc == QStringLiteral("HeapSize")) {   // SIZE_T(hHeap, dwFlags, lpMem) -- real size if we tracked it, else 0x1000
@@ -927,8 +1249,8 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
     }
 
     // --- identity / timing ---
-    if (sFunc == QStringLiteral("GetCurrentProcess")) { _return(pRegisters, 0xFFFFFFFFu, 0); return true; }
-    if (sFunc == QStringLiteral("GetCurrentThread")) { _return(pRegisters, 0xFFFFFFFEu, 0); return true; }
+    if (sFunc == QStringLiteral("GetCurrentProcess")) { _return(pRegisters, m_bIs64 ? ~quint64(0) : 0xFFFFFFFFu, 0); return true; }
+    if (sFunc == QStringLiteral("GetCurrentThread")) { _return(pRegisters, m_bIs64 ? ~quint64(1) : 0xFFFFFFFEu, 0); return true; }
     if (sFunc == QStringLiteral("GetCurrentProcessId")) { _return(pRegisters, 0x00001230u, 0); return true; }
     if (sFunc == QStringLiteral("GetCurrentThreadId")) { _return(pRegisters, 0x00001234u, 0); return true; }
     if (sFunc == QStringLiteral("GetTickCount")) { _return(pRegisters, 0x00100000u, 0); return true; }
@@ -965,6 +1287,19 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
         _return(pRegisters, 0, 1);
         return true;
     }
+    if (sFunc == QStringLiteral("GetSystemTime")) {
+        const XADDR p = (XADDR)_arg(pRegisters, 0);
+        if (p) {
+            const QDateTime now = QDateTime::currentDateTimeUtc();
+            const quint16 fields[] = {(quint16)now.date().year(), (quint16)now.date().month(),
+                                      (quint16)(now.date().dayOfWeek() % 7), (quint16)now.date().day(),
+                                      (quint16)now.time().hour(), (quint16)now.time().minute(),
+                                      (quint16)now.time().second(), (quint16)now.time().msec()};
+            for (int i = 0; i < 8; ++i) m_pMemoryManager->writeWord(p + (XADDR)i * 2, fields[i]);
+        }
+        _return(pRegisters, 0, 1);
+        return true;
+    }
     if (sFunc == QStringLiteral("GetDateFormatA")) {
         const XADDR pBuf = (XADDR)_arg(pRegisters, 3);
         const quint32 nChars = (quint32)_arg(pRegisters, 4);
@@ -998,12 +1333,12 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
         if (p) {
             m_pMemoryManager->writeDword(p + 0x00, 0x20);
             m_pMemoryManager->writeDword(p + 0x04, 1);
-            m_pMemoryManager->writeDword(p + 0x08, 0x7FFFFFFFu);
-            m_pMemoryManager->writeDword(p + 0x0C, 0x00100000u);
-            m_pMemoryManager->writeDword(p + 0x10, 0x00100000u);
-            m_pMemoryManager->writeDword(p + 0x14, 0x00100000u);
-            m_pMemoryManager->writeDword(p + 0x18, 0x00100000u);
-            m_pMemoryManager->writeDword(p + 0x1C, 0);
+            m_pMemoryManager->writeDword(p + 0x08, 0x08000000u);
+            m_pMemoryManager->writeDword(p + 0x0C, 0x02000000u);
+            m_pMemoryManager->writeDword(p + 0x10, 0x08000000u);
+            m_pMemoryManager->writeDword(p + 0x14, 0x02000000u);
+            m_pMemoryManager->writeDword(p + 0x18, 0x7FFFFFFFu);
+            m_pMemoryManager->writeDword(p + 0x1C, 0x40000000u);
             m_pMemoryManager->writeDword(p + 0x20, 0);
         }
         _return(pRegisters, 1, 1);
@@ -1011,19 +1346,45 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
     }
 
     // --- TLS ---
-    if (sFunc == QStringLiteral("TlsAlloc")) { _return(pRegisters, 1, 0); return true; }
-    if (sFunc == QStringLiteral("TlsSetValue")) { _return(pRegisters, 1, 2); return true; }
-    if (sFunc == QStringLiteral("TlsGetValue")) { _return(pRegisters, 0, 1); return true; }
-    if (sFunc == QStringLiteral("TlsFree")) { _return(pRegisters, 1, 1); return true; }
+    if (sFunc == QStringLiteral("TlsAlloc")) { _return(pRegisters, m_nNextTlsIndex++, 0); return true; }
+    if (sFunc == QStringLiteral("TlsSetValue")) {
+        m_tlsValues.insert((quint32)_arg(pRegisters, 0), (XADDR)_arg(pRegisters, 1));
+        _return(pRegisters, 1, 2);
+        return true;
+    }
+    if (sFunc == QStringLiteral("TlsGetValue")) {
+        _return(pRegisters, m_tlsValues.value((quint32)_arg(pRegisters, 0), 0), 1);
+        return true;
+    }
+    if (sFunc == QStringLiteral("TlsFree")) {
+        _return(pRegisters, m_tlsValues.remove((quint32)_arg(pRegisters, 0)) ? 1 : 0, 1);
+        return true;
+    }
 
     // --- misc no-ops with a success return ---
     if (sFunc == QStringLiteral("Sleep")) { _return(pRegisters, 0, 1); return true; }
     if (sFunc == QStringLiteral("SleepEx")) { _return(pRegisters, 0, 2); return true; }
     if (sFunc == QStringLiteral("FreeLibrary")) { _return(pRegisters, 1, 1); return true; }
     if (sFunc == QStringLiteral("OpenProcess")) { _return(pRegisters, 0x00E70000u, 4); return true; }
+    if (sFunc == QStringLiteral("DuplicateHandle")) {
+        const XADDR output = (XADDR)_arg(pRegisters, 3);
+        const XADDR handle = m_nFakeHandleCursor;
+        m_nFakeHandleCursor += 0x10000;
+        const bool ok = output && (m_bIs64
+            ? m_pMemoryManager->writeQword(output, handle)
+            : m_pMemoryManager->writeDword(output, (quint32)handle));
+        _return(pRegisters, ok ? 1 : 0, 7);
+        return true;
+    }
     if (sFunc == QStringLiteral("SetErrorMode")) { _return(pRegisters, 0, 1); return true; }
     if (sFunc == QStringLiteral("CloseHandle")) {
         const quint32 nHandle = (quint32)_arg(pRegisters, 0);
+        if (QFile *pFile = m_mapHostFiles.take(nHandle)) {
+            const bool bOk = !pFile->isWritable() || pFile->flush();
+            delete pFile;
+            _return(pRegisters, bOk ? 1 : 0, 1);
+            return true;
+        }
         // VMProtect 1.x uses CloseHandle(0xDEADC0DE) as an anti-debug probe.  A
         // normal process receives FALSE for that deliberately invalid value;
         // claiming success sends the loader down its debugger-found branch.
@@ -1034,7 +1395,28 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
         return true;
     }
     if (sFunc == QStringLiteral("SetConsoleCtrlHandler")) { _return(pRegisters, 1, 2); return true; }
-    if (sFunc == QStringLiteral("SetFilePointer")) { _return(pRegisters, 0, 4); return true; }
+    if (sFunc == QStringLiteral("SetFilePointer")) {
+        const quint32 nHandle = (quint32)_arg(pRegisters, 0);
+        QFile *pFile = m_mapHostFiles.value(nHandle, nullptr);
+        const XADDR nHigh = (XADDR)_arg(pRegisters, 2);
+        const quint32 nMethod = (quint32)_arg(pRegisters, 3);
+        qint64 nDistance = (qint32)_arg(pRegisters, 1);
+        if (nHigh) nDistance = (qint64)(qint32)m_pMemoryManager->readDword(nHigh) * 0x100000000ll + (quint32)nDistance;
+        const qint64 nOrigin = nMethod == 0 ? 0 : (nMethod == 1 && pFile ? pFile->pos() : (nMethod == 2 && pFile ? pFile->size() : -1));
+        if (!pFile || nOrigin < 0 || nDistance < -nOrigin ||
+            (nDistance > 0 && nOrigin > (std::numeric_limits<qint64>::max)() - nDistance)) {
+            _return(pRegisters, 0xFFFFFFFFu, 4);
+            return true;
+        }
+        const qint64 nPosition = nOrigin + nDistance;
+        if (!pFile->seek(nPosition)) {
+            _return(pRegisters, 0xFFFFFFFFu, 4);
+            return true;
+        }
+        if (nHigh) m_pMemoryManager->writeDword(nHigh, (quint32)((quint64)nPosition >> 32));
+        _return(pRegisters, (quint32)nPosition, 4);
+        return true;
+    }
     if (sFunc == QStringLiteral("SetHandleCount")) { _return(pRegisters, 1, 1); return true; }
     if (sFunc == QStringLiteral("SetEnvironmentVariableA")) { _return(pRegisters, 1, 2); return true; }
     if (sFunc == QStringLiteral("SetStdHandle")) { _return(pRegisters, 1, 2); return true; }
@@ -1045,8 +1427,12 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
     // dispatcher to resume the faulting instruction, producing an endless exception loop.
     if (sFunc == QStringLiteral("UnhandledExceptionFilter")) { _return(pRegisters, 1, 1); return true; }
     if (sFunc == QStringLiteral("CharUpperA")) { _return(pRegisters, (quint32)_arg(pRegisters, 0), 1); return true; }
-    if (sFunc == QStringLiteral("CreateEventA")) { _return(pRegisters, 0x00E70000u, 4); return true; }
-    if (sFunc == QStringLiteral("CreateEventW")) { _return(pRegisters, 0x00E70000u, 4); return true; }
+    if (sFunc == QStringLiteral("CreateEventA") || sFunc == QStringLiteral("CreateEventW")) {
+        const XADDR handle = m_nFakeHandleCursor;
+        m_nFakeHandleCursor += 0x10000;
+        _return(pRegisters, handle, 4);
+        return true;
+    }
     if (sFunc == QStringLiteral("RaiseException")) { _return(pRegisters, 0, 4); return true; }
     if (sFunc == QStringLiteral("RtlUnwind")) { _return(pRegisters, 0, 4); return true; }
     if (sFunc == QStringLiteral("FindFirstFileA")) { _return(pRegisters, 0x00E70100u, 2); return true; }
@@ -1179,21 +1565,47 @@ bool XEmuWinApi::_apiByName(XEmuRegisters *pRegisters, const QString &sFunc)
     // ZERO stdcall args and corrupts ESP -> the caller's next `pop`/`ret` grabs a stale value and
     // faults. The RETURN value is secondary; passing the correct stdcall arg count to _return is
     // the actual fix.
-    if (sFunc == QStringLiteral("GetStdHandle")) { _return(pRegisters, 0x00000010u, 1); return true; }   // any non-null pseudo-handle
+    if (sFunc == QStringLiteral("GetStdHandle")) {
+        const quint32 nKind = (quint32)_arg(pRegisters, 0);
+        _return(pRegisters, nKind == 0xFFFFFFF5u ? 0x10u : (nKind == 0xFFFFFFF4u ? 0x11u : 0x12u), 1);
+        return true;
+    }
     if (sFunc == QStringLiteral("GetConsoleMode")) { if (a2) m_pMemoryManager->writeDword(a2, 0x1F7); _return(pRegisters, 1, 2); return true; }  // BOOL(hCon, lpMode)
     if (sFunc == QStringLiteral("SetConsoleMode")) { _return(pRegisters, 1, 2); return true; }
     if ((sFunc == QStringLiteral("WriteFile")) || (sFunc == QStringLiteral("WriteConsoleA")) || (sFunc == QStringLiteral("WriteConsoleW"))) {
-        // BOOL(hFile, buf, nToWrite, lpWritten, lpOverlapped/lpReserved) -- report all bytes written.
+        const quint32 nHandle = (quint32)_arg(pRegisters, 0);
+        const XADDR nBuffer = (XADDR)_arg(pRegisters, 1);
         const quint32 nToWrite = (quint32)_arg(pRegisters, 2);
         const XADDR nWritten = (XADDR)_arg(pRegisters, 3);
-        if (nWritten) m_pMemoryManager->writeDword(nWritten, nToWrite);
-        _return(pRegisters, 1, 5);
+        bool bReadOk = false;
+        const QByteArray data = nToWrite <= (16u * 1024u * 1024u) ? m_pMemoryManager->read(nBuffer, nToWrite, &bReadOk) : QByteArray();
+        qint64 nDone = -1;
+        if (bReadOk) {
+            if (nHandle == 0x10u || nHandle == 0x11u) {
+                _consoleWrite(data, nHandle == 0x11u);
+                nDone = data.size();
+            } else if (QFile *pFile = m_mapHostFiles.value(nHandle, nullptr)) {
+                nDone = pFile->write(data);
+            }
+        }
+        if (nWritten) m_pMemoryManager->writeDword(nWritten, nDone < 0 ? 0 : (quint32)nDone);
+        _return(pRegisters, nDone < 0 ? 0 : 1, 5);
         return true;
     }
     if ((sFunc == QStringLiteral("ReadFile")) || (sFunc == QStringLiteral("ReadConsoleA")) || (sFunc == QStringLiteral("ReadConsoleW"))) {
-        const XADDR nRead = (XADDR)_arg(pRegisters, 3);   // lpNumberOfBytesRead
-        if (nRead) m_pMemoryManager->writeDword(nRead, 0);  // EOF: 0 bytes
-        _return(pRegisters, 1, 5);
+        const quint32 nHandle = (quint32)_arg(pRegisters, 0);
+        const XADDR nBuffer = (XADDR)_arg(pRegisters, 1);
+        const quint32 nToRead = (quint32)_arg(pRegisters, 2);
+        const XADDR nRead = (XADDR)_arg(pRegisters, 3);
+        QFile *pFile = m_mapHostFiles.value(nHandle, nullptr);
+        bool bOk = nHandle == 0x12u;
+        QByteArray data;
+        if (pFile && nToRead <= (16u * 1024u * 1024u)) {
+            data = pFile->read(nToRead);
+            bOk = pFile->error() == QFileDevice::NoError && m_pMemoryManager->write(nBuffer, data);
+        }
+        if (nRead) m_pMemoryManager->writeDword(nRead, bOk ? (quint32)data.size() : 0);
+        _return(pRegisters, bOk ? 1 : 0, 5);
         return true;
     }
     if (sFunc == QStringLiteral("MultiByteToWideChar")) {

@@ -1736,6 +1736,7 @@ bool XEmuWindows::setupProcess(XEmuFileFormat *pMainFormat, XEmuRegisters *pRegi
     delete m_pWinApi;
     m_pWinApi = new XEmuWinApi(m_pMemoryManager, m_pArch, m_bIs64);
     m_pWinApi->setLogger(std::bind(&XEmuWindows::_forwardWinApiLog, this, std::placeholders::_1));
+    m_pWinApi->setProcessContext(mainModule.sFileName, options.sCommandLine, options.sWorkingDirectory);
 
     if (!m_pWinApi->init()) {
         emit errorMessage(tr("Cannot allocate the emulated-API region"));
